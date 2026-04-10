@@ -5,6 +5,7 @@ import User from '../models/User.js';
 import { requireAuth } from '../middleware/auth.js';
 
 const router = express.Router();
+const FREE_IMAGE_LIMIT = 10;
 
 const createToken = (user) => jwt.sign({ userId: user._id.toString(), email: user.email }, process.env.JWT_SECRET, { expiresIn: '7d' });
 
@@ -206,6 +207,21 @@ router.patch('/me/usage/event', requireAuth, async (req, res) => {
       return res.status(400).json({ message: 'Invalid action. Use generate, edit, or fuse.' });
     }
 
+    const user = await User.findById(req.user.userId);
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    const isPro = user.plan === 'pro';
+    if (!isPro && (user.imagesGenerated || 0) >= FREE_IMAGE_LIMIT) {
+      return res.status(402).json({
+        message: 'Free plan limit reached. Upgrade to Pro for more generations.',
+        upgradeRequired: true,
+        freeLimit: FREE_IMAGE_LIMIT,
+        imagesGenerated: user.imagesGenerated || 0
+      });
+    }
+
     const increments = {
       promptsGenerated: 1,
       imagesGenerated: 1,
@@ -213,7 +229,7 @@ router.patch('/me/usage/event', requireAuth, async (req, res) => {
       imagesFused: action === 'fuse' ? 1 : 0
     };
 
-    const user = await User.findByIdAndUpdate(
+    const updatedUser = await User.findByIdAndUpdate(
       req.user.userId,
       {
         $inc: increments
@@ -221,11 +237,11 @@ router.patch('/me/usage/event', requireAuth, async (req, res) => {
       { new: true }
     );
 
-    if (!user) {
+    if (!updatedUser) {
       return res.status(404).json({ message: 'User not found' });
     }
 
-    res.json({ user: safeUser(user), increments });
+    res.json({ user: safeUser(updatedUser), increments });
   } catch (error) {
     res.status(500).json({ message: error instanceof Error ? error.message : 'Failed to track usage event' });
   }

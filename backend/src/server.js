@@ -5,6 +5,7 @@ import http from 'http';
 import { Server } from 'socket.io';
 import authRoutes from './routes/auth.js';
 import collaborationRoutes from './routes/collaboration.js';
+import billingRoutes, { handleStripeWebhook } from './routes/billing.js';
 import CollaborationLink from './models/CollaborationLink.js';
 import { connectDatabase } from './db.js';
 
@@ -117,6 +118,7 @@ io.on('connection', (socket) => {
 });
 
 app.use(cors({ origin: allowedOrigin }));
+app.post('/api/billing/webhook', express.raw({ type: 'application/json' }), handleStripeWebhook);
 app.use(express.json({ limit: '50mb' }));
 
 app.get('/api/health', (_req, res) => {
@@ -125,6 +127,7 @@ app.get('/api/health', (_req, res) => {
 
 app.use('/api/auth', authRoutes);
 app.use('/api/collab', collaborationRoutes);
+app.use('/api/billing', billingRoutes);
 
 const start = async () => {
   await connectDatabase(process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/arcane_engine');

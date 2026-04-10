@@ -73,6 +73,7 @@ interface CollaborationActivity {
 
 const STUDIO_SESSION_STORAGE_KEY = 'arcane-studio-session-v1';
 const COLLAB_WS_ORIGIN = import.meta.env.VITE_BACKEND_ORIGIN || 'http://localhost:4000';
+const FREE_IMAGE_LIMIT = 10;
 
 const toStoredImage = (image: GeneratedImage): StoredGeneratedImage => ({
   ...image,
@@ -593,6 +594,8 @@ const AppRoutes: React.FC<{ theme: ThemeMode; onToggleTheme: () => void }> = ({ 
   const [activeCollabCode, setActiveCollabCode] = useState('');
   const [collabStatus, setCollabStatus] = useState<'idle' | 'connecting' | 'live'>('idle');
   const [collabActivities, setCollabActivities] = useState<CollaborationActivity[]>([]);
+  const [showUpgradeModal, setShowUpgradeModal] = useState(false);
+  const [isStartingCheckout, setIsStartingCheckout] = useState(false);
   const collabSocketRef = useRef<Socket | null>(null);
   const suppressCollabSyncRef = useRef(false);
   const navigate = useNavigate();
@@ -603,6 +606,10 @@ const AppRoutes: React.FC<{ theme: ThemeMode; onToggleTheme: () => void }> = ({ 
   const compareRight = compareSelection.right ? historyLookup.get(compareSelection.right) || null : null;
   const isCompareReady = !!(compareLeft && compareRight && compareLeft.id !== compareRight.id);
   const visibleHistory = imageHistory.length ? imageHistory : currentImage ? [currentImage] : [];
+  const imagesGeneratedCount = authProfile?.imagesGenerated || 0;
+  const isProPlan = authProfile?.plan === 'pro';
+
+  const requiresUpgrade = !!authToken && !isProPlan && imagesGeneratedCount >= FREE_IMAGE_LIMIT;
 
   const toGeneratedImage = (item: { id: string; prompt: string; timestamp: string; base64?: string }) => ({
     id: item.id,
@@ -856,6 +863,43 @@ const AppRoutes: React.FC<{ theme: ThemeMode; onToggleTheme: () => void }> = ({ 
     setTimeout(() => setToast(null), 5000);
   };
 
+  const startProCheckout = async () => {
+    if (!authToken) {
+      showToast('Please sign in to upgrade to Pro.', 'error');
+      navigate('/login');
+      return;
+    }
+
+    try {
+      setIsStartingCheckout(true);
+      const response = await fetch('/api/billing/create-checkout-session', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${authToken}`
+        }
+      });
+
+      const data = await response.json();
+      if (!response.ok || !data?.checkoutUrl) {
+        throw new Error(data?.message || 'Failed to start checkout.');
+      }
+
+      window.location.href = data.checkoutUrl as string;
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'Failed to start checkout.', 'error');
+    } finally {
+      setIsStartingCheckout(false);
+    }
+  };
+
+  const assertWithinGenerationLimit = () => {
+    if (!requiresUpgrade) return true;
+    setShowUpgradeModal(true);
+    showToast('Free plan limit reached. Upgrade to Pro for more generations.', 'error');
+    return false;
+  };
+
   const trackStudioSubmit = async (action: 'generate' | 'edit' | 'fuse') => {
     const authToken = localStorage.getItem('arcane-auth-token');
     if (!authToken) return;
@@ -871,6 +915,9 @@ const AppRoutes: React.FC<{ theme: ThemeMode; onToggleTheme: () => void }> = ({ 
       });
 
       if (response.ok) {
+        window.dispatchEvent(new Event('arcane-profile-refresh'));
+      } else if (response.status === 402) {
+        setShowUpgradeModal(true);
         window.dispatchEvent(new Event('arcane-profile-refresh'));
       }
     } catch {
@@ -1113,6 +1160,46 @@ const AppRoutes: React.FC<{ theme: ThemeMode; onToggleTheme: () => void }> = ({ 
     return () => window.removeEventListener('arcane-profile-refresh', handleUsageRefresh);
   }, [authToken]);
 
+  useEffect(() => {
+    const status = new URLSearchParams(location.search).get('billing');
+    const sessionId = new URLSearchParams(location.search).get('session_id');
+    if (!status) return;
+
+    void (async () => {
+      if (status === 'success' && sessionId && authToken) {
+        try {
+          const response = await fetch('/api/billing/confirm-checkout-session', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${authToken}`
+            },
+            body: JSON.stringify({ sessionId })
+          });
+
+          const data = await response.json();
+          if (!response.ok) {
+            throw new Error(data?.message || 'Could not verify checkout result.');
+          }
+
+          showToast('Pro upgraded successfully. Unlimited generation unlocked.', 'success');
+          await refreshAuthProfile();
+          setShowUpgradeModal(false);
+        } catch (err) {
+          showToast(err instanceof Error ? err.message : 'Failed to confirm payment. Please contact support.', 'error');
+        }
+      } else if (status === 'cancel') {
+        showToast('Upgrade cancelled.', 'error');
+      }
+
+      const params = new URLSearchParams(location.search);
+      params.delete('billing');
+      params.delete('session_id');
+      const next = params.toString();
+      navigate(`${location.pathname}${next ? `?${next}` : ''}`, { replace: true });
+    })();
+  }, [location.pathname, location.search, authToken]);
+
   const logoutAndGoToLogin = () => {
     void (async () => {
       const token = localStorage.getItem('arcane-auth-token');
@@ -1139,6 +1226,7 @@ const AppRoutes: React.FC<{ theme: ThemeMode; onToggleTheme: () => void }> = ({ 
   };
 
   const handleGenerate = async (prompt: string) => {
+    if (!assertWithinGenerationLimit()) return;
     try {
       const base64 = await generateImage(prompt);
       const nextImage = { id: Date.now().toString(), base64, prompt, timestamp: new Date() };
@@ -1152,6 +1240,7 @@ const AppRoutes: React.FC<{ theme: ThemeMode; onToggleTheme: () => void }> = ({ 
     }
   };
   const handleEdit = async (prompt: string) => {
+    if (!assertWithinGenerationLimit()) return;
     if (!currentImage) return showToast('No image to edit. Generate an image first.', 'error');
     try {
       const base64 = await editImage(currentImage.base64, prompt);
@@ -1166,6 +1255,7 @@ const AppRoutes: React.FC<{ theme: ThemeMode; onToggleTheme: () => void }> = ({ 
     }
   };
   const handleFuse = async (prompt: string) => {
+    if (!assertWithinGenerationLimit()) return;
     if (!uploadedImages.img1 || !uploadedImages.img2) return showToast('Please upload two images to fuse.', 'error');
     try {
       const base64 = await fuseImages(uploadedImages.img1, uploadedImages.img2, prompt);
@@ -1489,6 +1579,25 @@ const AppRoutes: React.FC<{ theme: ThemeMode; onToggleTheme: () => void }> = ({ 
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </AnimatePresence>
+      {showUpgradeModal && (
+        <div className="fixed inset-0 z-[80] bg-black/70 backdrop-blur-sm p-4 grid place-items-center">
+          <div className="w-full max-w-md glass-panel rounded-3xl p-6 border border-cyan-200/30">
+            <p className="text-xs uppercase tracking-[0.22em] text-cyan-300/80 mb-2">Upgrade Required</p>
+            <h3 className="text-2xl font-semibold text-slate-100 mb-2">Free limit reached</h3>
+            <p className="text-sm text-slate-300 mb-5">
+              You have used {imagesGeneratedCount}/{FREE_IMAGE_LIMIT} free generations. Upgrade to Pro for more image generation access.
+            </p>
+            <div className="flex flex-wrap gap-3 justify-end">
+              <button className="arcane-btn arcane-btn-ghost" type="button" onClick={() => setShowUpgradeModal(false)}>
+                Maybe later
+              </button>
+              <button className="arcane-btn arcane-btn-primary" type="button" onClick={() => void startProCheckout()} disabled={isStartingCheckout}>
+                {isStartingCheckout ? 'Redirecting...' : 'Upgrade to Pro'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
     </>
   );
