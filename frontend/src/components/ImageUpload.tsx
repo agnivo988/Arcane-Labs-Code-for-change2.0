@@ -13,8 +13,33 @@ const ImageUpload: React.FC<ImageUploadProps> = ({ label, onImageUpload, current
       const reader = new FileReader();
       reader.onload = () => {
         const result = reader.result as string;
-        const base64 = result.split(',')[1];
-        resolve(base64);
+        const img = new Image();
+        img.onload = () => {
+          const maxDim = 1600;
+          let { width, height } = img;
+          const scale = Math.min(1, maxDim / Math.max(width, height));
+          width = Math.max(1, Math.round(width * scale));
+          height = Math.max(1, Math.round(height * scale));
+
+          const canvas = document.createElement('canvas');
+          canvas.width = width;
+          canvas.height = height;
+
+          const ctx = canvas.getContext('2d');
+          if (!ctx) {
+            reject(new Error('Failed to process image canvas'));
+            return;
+          }
+
+          ctx.drawImage(img, 0, 0, width, height);
+          const isPng = file.type === 'image/png';
+          const mime = isPng ? 'image/png' : 'image/jpeg';
+          const dataUrl = canvas.toDataURL(mime, isPng ? 0.92 : 0.88);
+          const base64 = dataUrl.split(',')[1];
+          resolve(base64);
+        };
+        img.onerror = () => reject(new Error('Failed to decode image'));
+        img.src = result;
       };
       reader.onerror = reject;
       reader.readAsDataURL(file);

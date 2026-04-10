@@ -12,7 +12,8 @@ const userSchema = new mongoose.Schema(
     imagesGenerated: { type: Number, default: 0 },
     imagesEdited: { type: Number, default: 0 },
     imagesFused: { type: Number, default: 0 },
-    lastLoginAt: { type: Date, default: null }
+    lastLoginAt: { type: Date, default: null },
+    studioSessionState: { type: mongoose.Schema.Types.Mixed, default: null }
   },
   { timestamps: true }
 );

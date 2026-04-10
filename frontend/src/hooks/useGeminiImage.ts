@@ -9,17 +9,27 @@ interface QueueItem {
 let requestQueue: QueueItem[] = [];
 let isProcessing = false;
 let lastRequestTime = 0;
+const modelCooldownUntil: Record<string, number> = {};
+
+const MIN_REQUEST_GAP_MS = Number(import.meta.env.VITE_GEMINI_MIN_REQUEST_GAP_MS || 550);
+const TRANSIENT_MODEL_COOLDOWN_MS = 60_000;
+const UNAVAILABLE_MODEL_COOLDOWN_MS = 10 * 60_000;
 
 const DEFAULT_IMAGE_MODELS = [
   'gemini-2.5-flash-image',
+  'gemini-2.5-flash-image-preview',
   'gemini-3.1-flash-image-preview'
 ];
 
 const getCandidateModels = () => {
   const overrideModel = (import.meta.env.VITE_GEMINI_IMAGE_MODEL || '').trim();
-  return overrideModel
+  const candidates = overrideModel
     ? [overrideModel, ...DEFAULT_IMAGE_MODELS.filter((model) => model !== overrideModel)]
     : DEFAULT_IMAGE_MODELS;
+
+  const now = Date.now();
+  const readyModels = candidates.filter((model) => (modelCooldownUntil[model] || 0) <= now);
+  return readyModels.length ? readyModels : candidates;
 };
 
 const isModelAvailabilityError = (message: string) => {
@@ -28,6 +38,20 @@ const isModelAvailabilityError = (message: string) => {
     lower.includes('not found') ||
     lower.includes('supported for generatecontent') ||
     lower.includes('404')
+  );
+};
+
+const isTransientModelLoadError = (message: string) => {
+  const lower = message.toLowerCase();
+  return (
+    lower.includes('429') ||
+    lower.includes('resource_exhausted') ||
+    lower.includes('rate limit') ||
+    lower.includes('too many requests') ||
+    lower.includes('overloaded') ||
+    lower.includes('high traffic') ||
+    lower.includes('temporarily unavailable') ||
+    lower.includes('try again later')
   );
 };
 
@@ -40,8 +64,8 @@ const processQueue = async () => {
     const now = Date.now();
     const timeSinceLastRequest = now - lastRequestTime;
     
-    if (timeSinceLastRequest < 3000) {
-      await new Promise(resolve => setTimeout(resolve, 3000 - timeSinceLastRequest));
+    if (timeSinceLastRequest < MIN_REQUEST_GAP_MS) {
+      await new Promise(resolve => setTimeout(resolve, MIN_REQUEST_GAP_MS - timeSinceLastRequest));
     }
     
     const item = requestQueue.shift();
@@ -99,9 +123,14 @@ export const useGeminiImage = (apiKey: string) => {
         });
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
-        if (!isModelAvailabilityError(message)) {
+        const unavailable = isModelAvailabilityError(message);
+        const transient = isTransientModelLoadError(message);
+
+        if (!unavailable && !transient) {
           throw err;
         }
+
+        modelCooldownUntil[model] = Date.now() + (unavailable ? UNAVAILABLE_MODEL_COOLDOWN_MS : TRANSIENT_MODEL_COOLDOWN_MS);
         lastError = err instanceof Error ? err : new Error(message);
       }
     }

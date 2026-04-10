@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { AnimatePresence, motion, useScroll, useTransform } from 'framer-motion';
-import { NavLink, Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom';
+import { NavLink, Navigate, Route, Routes, useLocation, useNavigate, useParams } from 'react-router-dom';
+import { io, type Socket } from 'socket.io-client';
 import { useGeminiImage } from './hooks/useGeminiImage';
 import ApiKeyInput from './components/ApiKeyInput';
 import PromptForm from './components/PromptForm';
@@ -33,6 +34,61 @@ interface UserProfile {
   lastLoginAt?: string | null;
   createdAt?: string;
 }
+
+interface StoredGeneratedImage {
+  id: string;
+  base64: string;
+  prompt: string;
+  timestamp: string;
+}
+
+interface StudioSessionSnapshot {
+  apiKey: string;
+  currentImage: StoredGeneratedImage | null;
+  imageHistory: StoredGeneratedImage[];
+  compareSelection: { left: string | null; right: string | null };
+}
+
+interface ServerSessionState {
+  currentImage: { id: string; prompt: string; timestamp: string; base64?: string } | null;
+  imageHistory: Array<{ id: string; prompt: string; timestamp: string; base64?: string }>;
+  compareSelection: { left: string | null; right: string | null };
+  lastActivity?: { id: string; text: string; actor?: string; timestamp: string };
+  updatedAt?: string;
+}
+
+interface CollaborationLoadResponse {
+  code: string;
+  session: ServerSessionState;
+  createdAt?: string;
+  expiresAt?: string;
+}
+
+interface CollaborationActivity {
+  id: string;
+  text: string;
+  actor?: string;
+  timestamp: string;
+}
+
+const STUDIO_SESSION_STORAGE_KEY = 'arcane-studio-session-v1';
+const COLLAB_WS_ORIGIN = import.meta.env.VITE_BACKEND_ORIGIN || 'http://localhost:4000';
+
+const toStoredImage = (image: GeneratedImage): StoredGeneratedImage => ({
+  ...image,
+  timestamp: image.timestamp.toISOString()
+});
+
+const fromStoredImage = (image: StoredGeneratedImage): GeneratedImage => ({
+  ...image,
+  timestamp: new Date(image.timestamp)
+});
+
+const toServerImageMeta = (image: GeneratedImage) => ({
+  id: image.id,
+  prompt: image.prompt,
+  timestamp: image.timestamp.toISOString()
+});
 
 const LoadingScreen: React.FC<{ done: boolean }> = ({ done }) => (
   <div className={`loader-shell ${done ? 'is-exiting' : ''}`}>
@@ -522,14 +578,220 @@ const SiteChrome: React.FC<{ children: React.ReactNode; theme: ThemeMode; onTogg
 const AppRoutes: React.FC<{ theme: ThemeMode; onToggleTheme: () => void }> = ({ theme, onToggleTheme }) => {
   const [apiKey, setApiKey] = useState('');
   const [currentImage, setCurrentImage] = useState<GeneratedImage | null>(null);
+  const [imageHistory, setImageHistory] = useState<GeneratedImage[]>([]);
   const [uploadedImages, setUploadedImages] = useState<{ img1: string | null; img2: string | null }>({ img1: null, img2: null });
+  const [compareSelection, setCompareSelection] = useState<{ left: string | null; right: string | null }>({ left: null, right: null });
   const [toast, setToast] = useState<{ message: string; type: 'error' | 'success' } | null>(null);
   const [authToken, setAuthToken] = useState<string | null>(() => localStorage.getItem('arcane-auth-token'));
   const [authProfile, setAuthProfile] = useState<UserProfile | null>(null);
   const [authLoading, setAuthLoading] = useState(false);
+  const [hasHydratedServerSession, setHasHydratedServerSession] = useState(false);
+  const [shareLink, setShareLink] = useState('');
+  const [shareInput, setShareInput] = useState('');
+  const [isCreatingShare, setIsCreatingShare] = useState(false);
+  const [isImportingShare, setIsImportingShare] = useState(false);
+  const [activeCollabCode, setActiveCollabCode] = useState('');
+  const [collabStatus, setCollabStatus] = useState<'idle' | 'connecting' | 'live'>('idle');
+  const [collabActivities, setCollabActivities] = useState<CollaborationActivity[]>([]);
+  const collabSocketRef = useRef<Socket | null>(null);
+  const suppressCollabSyncRef = useRef(false);
   const navigate = useNavigate();
   const location = useLocation();
   const { generateImage, editImage, fuseImages, isLoading, error, clearError } = useGeminiImage(apiKey);
+  const historyLookup = useMemo(() => new Map(imageHistory.map((image) => [image.id, image])), [imageHistory]);
+  const compareLeft = compareSelection.left ? historyLookup.get(compareSelection.left) || null : null;
+  const compareRight = compareSelection.right ? historyLookup.get(compareSelection.right) || null : null;
+  const isCompareReady = !!(compareLeft && compareRight && compareLeft.id !== compareRight.id);
+  const visibleHistory = imageHistory.length ? imageHistory : currentImage ? [currentImage] : [];
+
+  const toGeneratedImage = (item: { id: string; prompt: string; timestamp: string; base64?: string }) => ({
+    id: item.id,
+    prompt: item.prompt,
+    base64: typeof item.base64 === 'string' ? item.base64 : '',
+    timestamp: new Date(item.timestamp)
+  });
+
+  const extractCollabCode = (input: string) => {
+    const raw = input.trim();
+    if (!raw) return '';
+    if (/^[A-Za-z0-9]{6,12}$/.test(raw)) return raw.toUpperCase();
+
+    try {
+      const parsed = new URL(raw);
+      const parts = parsed.pathname.split('/').filter(Boolean);
+      const collabIdx = parts.findIndex((part) => part.toLowerCase() === 'collab');
+      if (collabIdx !== -1 && parts[collabIdx + 1]) {
+        return parts[collabIdx + 1].toUpperCase();
+      }
+    } catch {
+      return '';
+    }
+
+    return '';
+  };
+
+  const applyIncomingSession = (session: ServerSessionState) => {
+    const sourceHistory = Array.isArray(session.imageHistory) && session.imageHistory.length > 0
+      ? session.imageHistory
+      : session.currentImage
+        ? [session.currentImage]
+        : [];
+    const incomingHistory = sourceHistory
+      .filter((item) => item && item.id && item.prompt)
+      .map(toGeneratedImage);
+
+    if (session.currentImage) {
+      setCurrentImage(toGeneratedImage(session.currentImage));
+    }
+
+    setImageHistory((prev) => {
+      const incomingById = new Map(incomingHistory.map((item) => [item.id, item]));
+      const merged = [
+        ...incomingHistory,
+        ...prev.filter((item) => !incomingById.has(item.id))
+      ].slice(0, 24);
+      return merged;
+    });
+
+    if (session.compareSelection) {
+      setCompareSelection(session.compareSelection);
+    }
+
+    if (session.lastActivity?.id && session.lastActivity?.text) {
+      setCollabActivities((prev) => [session.lastActivity as CollaborationActivity, ...prev.filter((item) => item.id !== session.lastActivity?.id)].slice(0, 30));
+    }
+  };
+
+  const emitCollabActivity = (text: string) => {
+    if (!activeCollabCode) return;
+    const activity: CollaborationActivity = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      text,
+      actor: authProfile?.name || authProfile?.email || 'Collaborator',
+      timestamp: new Date().toISOString()
+    };
+    setCollabActivities((prev) => [activity, ...prev].slice(0, 30));
+
+    const socket = collabSocketRef.current;
+    if (!socket || !socket.connected) return;
+    socket.emit('collab:state', {
+      code: activeCollabCode,
+      session: {
+        currentImage: currentImage
+          ? {
+            id: currentImage.id,
+            prompt: currentImage.prompt,
+            timestamp: currentImage.timestamp.toISOString(),
+            ...(currentImage.base64 ? { base64: currentImage.base64.slice(0, 1_200_000) } : {})
+          }
+          : null,
+        imageHistory: imageHistory.slice(0, 10).map((item) => ({
+          id: item.id,
+          prompt: item.prompt,
+          timestamp: item.timestamp.toISOString()
+        })),
+        compareSelection,
+        lastActivity: activity,
+        updatedAt: new Date().toISOString()
+      } as ServerSessionState
+    });
+  };
+
+  const importCollaborationCode = async (input: string) => {
+    const code = extractCollabCode(input);
+    if (!code) {
+      showToast('Enter a valid collaboration code or full link.', 'error');
+      return;
+    }
+
+    try {
+      setIsImportingShare(true);
+      const response = await fetch(`/api/collab/${code}`);
+      if (!response.ok) {
+        throw new Error(response.status === 404 ? 'Collaboration link not found.' : 'Could not import collaboration link.');
+      }
+      const data = (await response.json()) as CollaborationLoadResponse;
+      if (!data.session) throw new Error('This collaboration link has no session data.');
+      applyIncomingSession(data.session);
+      setActiveCollabCode(code);
+      const liveUrl = `${window.location.origin}/collab/${code}`;
+      setShareLink(liveUrl);
+      setShareInput('');
+      navigate(`/studio?collab=${code}`);
+      showToast('Collaboration session imported.', 'success');
+      emitCollabActivity('joined the collaboration room');
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'Failed to import collaboration link.', 'error');
+    } finally {
+      setIsImportingShare(false);
+    }
+  };
+
+  const createCollaborationLink = async () => {
+    if (!authToken) {
+      showToast('Sign in to create collaboration links.', 'error');
+      navigate('/login');
+      return;
+    }
+
+    try {
+      setIsCreatingShare(true);
+      const currentBase64 = currentImage?.base64 || '';
+      const includeCurrentBase64 = currentBase64.length > 0 && currentBase64.length <= 1_200_000;
+      const collabHistory = imageHistory.slice(0, 8).map((item) => ({
+        id: item.id,
+        prompt: item.prompt,
+        timestamp: item.timestamp.toISOString()
+      }));
+
+      const collabCurrent = currentImage
+        ? {
+          id: currentImage.id,
+          prompt: currentImage.prompt,
+          timestamp: currentImage.timestamp.toISOString(),
+          ...(includeCurrentBase64 ? { base64: currentBase64 } : {})
+        }
+        : null;
+
+      const payload: ServerSessionState = {
+        currentImage: collabCurrent,
+        imageHistory: collabHistory,
+        compareSelection,
+        updatedAt: new Date().toISOString()
+      };
+
+      const response = await fetch('/api/collab', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${authToken}`
+        },
+        body: JSON.stringify({ session: payload, expiresInDays: 7 })
+      });
+
+      if (!response.ok) {
+        throw new Error('Could not create collaboration link.');
+      }
+
+      const data = (await response.json()) as { code: string };
+      const url = `${window.location.origin}/collab/${data.code}`;
+      setActiveCollabCode(data.code);
+      setShareLink(url);
+      setShareInput(url);
+      navigate(`/studio?collab=${data.code}`);
+      try {
+        await navigator.clipboard.writeText(url);
+        showToast('Collaboration link created and copied.', 'success');
+      } catch {
+        showToast('Collaboration link created.', 'success');
+      }
+      emitCollabActivity('started a collaboration session');
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'Failed to create collaboration link.', 'error');
+    } finally {
+      setIsCreatingShare(false);
+    }
+  };
 
   const fetchAuthProfile = async (token: string) => {
     const response = await fetch('/api/auth/me', {
@@ -538,6 +800,33 @@ const AppRoutes: React.FC<{ theme: ThemeMode; onToggleTheme: () => void }> = ({ 
     if (!response.ok) throw new Error('Failed to load profile');
     const data = await response.json();
     return data.user as UserProfile;
+  };
+
+  const fetchServerSession = async (token: string) => {
+    const response = await fetch('/api/auth/me/session', {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    if (!response.ok) throw new Error('Failed to load session');
+    const data = await response.json();
+    return (data.session as ServerSessionState | null) || null;
+  };
+
+  const saveServerSession = async (token: string, session: ServerSessionState) => {
+    await fetch('/api/auth/me/session', {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`
+      },
+      body: JSON.stringify({ session })
+    });
+  };
+
+  const clearServerSession = async (token: string) => {
+    await fetch('/api/auth/me/session', {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${token}` }
+    });
   };
 
   const clearAuth = () => {
@@ -597,6 +886,212 @@ const AppRoutes: React.FC<{ theme: ThemeMode; onToggleTheme: () => void }> = ({ 
   }, [error, clearError]);
 
   useEffect(() => {
+    try {
+      const raw = localStorage.getItem(STUDIO_SESSION_STORAGE_KEY);
+      if (!raw) return;
+      const snapshot = JSON.parse(raw) as StudioSessionSnapshot;
+      if (snapshot.apiKey) setApiKey(snapshot.apiKey);
+      if (snapshot.currentImage) setCurrentImage(fromStoredImage(snapshot.currentImage));
+      if (Array.isArray(snapshot.imageHistory)) {
+        setImageHistory(snapshot.imageHistory.slice(0, 24).map(fromStoredImage));
+      }
+      if (snapshot.compareSelection) setCompareSelection(snapshot.compareSelection);
+    } catch {
+      localStorage.removeItem(STUDIO_SESSION_STORAGE_KEY);
+    }
+  }, []);
+
+  useEffect(() => {
+    const snapshot: StudioSessionSnapshot = {
+      apiKey,
+      currentImage: currentImage ? toStoredImage(currentImage) : null,
+      imageHistory: imageHistory.map(toStoredImage),
+      compareSelection
+    };
+    try {
+      localStorage.setItem(STUDIO_SESSION_STORAGE_KEY, JSON.stringify(snapshot));
+    } catch {
+      // Ignore quota errors to keep studio responsive on large image payloads.
+    }
+  }, [apiKey, currentImage, imageHistory, compareSelection]);
+
+  useEffect(() => {
+    if (!authToken) {
+      setHasHydratedServerSession(true);
+      return;
+    }
+    let cancelled = false;
+
+    const hydrate = async () => {
+      try {
+        const serverSession = await fetchServerSession(authToken);
+        if (!serverSession || cancelled) return;
+
+        setImageHistory((prev) => {
+          const localById = new Map(prev.map((item) => [item.id, item]));
+          const hasServerHistory = Array.isArray(serverSession.imageHistory) && serverSession.imageHistory.length > 0;
+          const historySource = hasServerHistory
+            ? serverSession.imageHistory
+            : serverSession.currentImage
+              ? [serverSession.currentImage]
+              : [];
+
+          const serverHistory = historySource.map((item) => {
+              const local = localById.get(item.id);
+              if (local) return local;
+              return {
+                id: item.id,
+                prompt: item.prompt,
+                base64: typeof item.base64 === 'string' ? item.base64 : '',
+                timestamp: new Date(item.timestamp)
+              } as GeneratedImage;
+            });
+
+          const merged = [
+            ...serverHistory,
+            ...prev.filter((item) => !serverHistory.some((serverItem) => serverItem.id === item.id))
+          ].slice(0, 24);
+
+          return merged;
+        });
+
+        if (serverSession.currentImage) {
+          const serverCurrent = serverSession.currentImage;
+          setCurrentImage((prev) => {
+            if (prev?.id === serverCurrent.id) return prev;
+            if (prev && prev.base64 && prev.id !== serverCurrent.id) return prev;
+            return {
+              id: serverCurrent.id,
+              prompt: serverCurrent.prompt,
+              base64: typeof serverCurrent.base64 === 'string' ? serverCurrent.base64 : '',
+              timestamp: new Date(serverCurrent.timestamp)
+            };
+          });
+        }
+
+        if (serverSession.compareSelection) {
+          setCompareSelection(serverSession.compareSelection);
+        }
+      } catch {
+        // Fallback to local session if backend session is unavailable.
+      } finally {
+        if (!cancelled) setHasHydratedServerSession(true);
+      }
+    };
+
+    void hydrate();
+    return () => {
+      cancelled = true;
+    };
+  }, [authToken]);
+
+  useEffect(() => {
+    if (!authToken || !hasHydratedServerSession) return;
+    const timer = window.setTimeout(() => {
+      const payload: ServerSessionState = {
+        currentImage: currentImage ? toServerImageMeta(currentImage) : null,
+        imageHistory: imageHistory.map(toServerImageMeta),
+        compareSelection,
+        updatedAt: new Date().toISOString()
+      };
+      void saveServerSession(authToken, payload);
+    }, 350);
+
+    return () => window.clearTimeout(timer);
+  }, [authToken, hasHydratedServerSession, currentImage, imageHistory, compareSelection]);
+
+  useEffect(() => {
+    if (location.pathname !== '/studio') return;
+    const codeFromQuery = new URLSearchParams(location.search).get('collab');
+    const code = codeFromQuery && /^[A-Za-z0-9]{6,12}$/.test(codeFromQuery)
+      ? codeFromQuery.toUpperCase()
+      : '';
+    if (code && code !== activeCollabCode) {
+      setActiveCollabCode(code);
+      setShareLink(`${window.location.origin}/collab/${code}`);
+    }
+  }, [location.pathname, location.search, activeCollabCode]);
+
+  useEffect(() => {
+    if (!activeCollabCode) {
+      setCollabStatus('idle');
+      if (collabSocketRef.current) {
+        collabSocketRef.current.disconnect();
+        collabSocketRef.current = null;
+      }
+      return;
+    }
+
+    setCollabStatus('connecting');
+    const socket = io(COLLAB_WS_ORIGIN, { transports: ['websocket', 'polling'] });
+    collabSocketRef.current = socket;
+
+    socket.on('connect', () => {
+      socket.emit('collab:join', { code: activeCollabCode });
+    });
+
+    socket.on('collab:session', (payload: { code: string; session: ServerSessionState }) => {
+      if (!payload?.session) return;
+      if (payload.code && payload.code.toUpperCase() !== activeCollabCode.toUpperCase()) return;
+      suppressCollabSyncRef.current = true;
+      applyIncomingSession(payload.session);
+      setCollabStatus('live');
+    });
+
+    socket.on('collab:error', (payload: { message?: string }) => {
+      setCollabStatus('idle');
+      showToast(payload?.message || 'Collaboration connection failed.', 'error');
+    });
+
+    socket.on('disconnect', () => {
+      setCollabStatus('connecting');
+    });
+
+    return () => {
+      socket.disconnect();
+      if (collabSocketRef.current === socket) {
+        collabSocketRef.current = null;
+      }
+    };
+  }, [activeCollabCode]);
+
+  useEffect(() => {
+    if (!activeCollabCode) return;
+    const socket = collabSocketRef.current;
+    if (!socket || !socket.connected) return;
+    if (suppressCollabSyncRef.current) {
+      suppressCollabSyncRef.current = false;
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      const currentBase64 = currentImage?.base64 || '';
+      const includeCurrentBase64 = currentBase64.length > 0 && currentBase64.length <= 1_200_000;
+      const payload: ServerSessionState = {
+        currentImage: currentImage
+          ? {
+            id: currentImage.id,
+            prompt: currentImage.prompt,
+            timestamp: currentImage.timestamp.toISOString(),
+            ...(includeCurrentBase64 ? { base64: currentBase64 } : {})
+          }
+          : null,
+        imageHistory: imageHistory.slice(0, 10).map((item) => ({
+          id: item.id,
+          prompt: item.prompt,
+          timestamp: item.timestamp.toISOString()
+        })),
+        compareSelection,
+        lastActivity: undefined,
+        updatedAt: new Date().toISOString()
+      };
+      socket.emit('collab:state', { code: activeCollabCode, session: payload });
+    }, 220);
+
+    return () => window.clearTimeout(timer);
+  }, [activeCollabCode, currentImage, imageHistory, compareSelection]);
+
+  useEffect(() => {
     const syncToken = () => setAuthToken(localStorage.getItem('arcane-auth-token'));
     window.addEventListener('arcane-auth-changed', syncToken as EventListener);
     window.addEventListener('storage', syncToken);
@@ -619,9 +1114,19 @@ const AppRoutes: React.FC<{ theme: ThemeMode; onToggleTheme: () => void }> = ({ 
   }, [authToken]);
 
   const logoutAndGoToLogin = () => {
-    clearAuth();
-    window.dispatchEvent(new Event('arcane-auth-changed'));
-    navigate('/login');
+    void (async () => {
+      const token = localStorage.getItem('arcane-auth-token');
+      if (token) {
+        try {
+          await clearServerSession(token);
+        } catch {
+          // Continue local logout even if backend session clear fails.
+        }
+      }
+      clearAuth();
+      window.dispatchEvent(new Event('arcane-auth-changed'));
+      navigate('/login');
+    })();
   };
 
   const openLiveMode = () => {
@@ -636,8 +1141,11 @@ const AppRoutes: React.FC<{ theme: ThemeMode; onToggleTheme: () => void }> = ({ 
   const handleGenerate = async (prompt: string) => {
     try {
       const base64 = await generateImage(prompt);
-      setCurrentImage({ id: Date.now().toString(), base64, prompt, timestamp: new Date() });
+      const nextImage = { id: Date.now().toString(), base64, prompt, timestamp: new Date() };
+      setCurrentImage(nextImage);
+      setImageHistory((prev) => [nextImage, ...prev.filter((item) => item.id !== nextImage.id)].slice(0, 24));
       void trackStudioSubmit('generate');
+      emitCollabActivity(`generated: ${prompt.slice(0, 80)}`);
       showToast('Image generated successfully!', 'success');
     } catch (err) {
       showToast(err instanceof Error ? err.message : 'Failed to generate image', 'error');
@@ -647,8 +1155,11 @@ const AppRoutes: React.FC<{ theme: ThemeMode; onToggleTheme: () => void }> = ({ 
     if (!currentImage) return showToast('No image to edit. Generate an image first.', 'error');
     try {
       const base64 = await editImage(currentImage.base64, prompt);
-      setCurrentImage({ id: Date.now().toString(), base64, prompt: `${currentImage.prompt} → ${prompt}`, timestamp: new Date() });
+      const nextImage = { id: Date.now().toString(), base64, prompt: `${currentImage.prompt} → ${prompt}`, timestamp: new Date() };
+      setCurrentImage(nextImage);
+      setImageHistory((prev) => [nextImage, ...prev.filter((item) => item.id !== nextImage.id)].slice(0, 24));
       void trackStudioSubmit('edit');
+      emitCollabActivity(`edited image: ${prompt.slice(0, 80)}`);
       showToast('Image edited successfully!', 'success');
     } catch (err) {
       showToast(err instanceof Error ? err.message : 'Failed to edit image', 'error');
@@ -658,20 +1169,159 @@ const AppRoutes: React.FC<{ theme: ThemeMode; onToggleTheme: () => void }> = ({ 
     if (!uploadedImages.img1 || !uploadedImages.img2) return showToast('Please upload two images to fuse.', 'error');
     try {
       const base64 = await fuseImages(uploadedImages.img1, uploadedImages.img2, prompt);
-      setCurrentImage({ id: Date.now().toString(), base64, prompt: `Fused: ${prompt}`, timestamp: new Date() });
+      const nextImage = { id: Date.now().toString(), base64, prompt: `Fused: ${prompt}`, timestamp: new Date() };
+      setCurrentImage(nextImage);
+      setImageHistory((prev) => [nextImage, ...prev.filter((item) => item.id !== nextImage.id)].slice(0, 24));
       void trackStudioSubmit('fuse');
+      emitCollabActivity(`fused sources: ${prompt.slice(0, 80)}`);
       showToast('Images fused successfully!', 'success');
     } catch (err) {
       showToast(err instanceof Error ? err.message : 'Failed to fuse images', 'error');
     }
   };
 
+  const clearStudioSession = () => {
+    setCurrentImage(null);
+    setUploadedImages({ img1: null, img2: null });
+    setImageHistory([]);
+    setCompareSelection({ left: null, right: null });
+    localStorage.removeItem(STUDIO_SESSION_STORAGE_KEY);
+    const token = localStorage.getItem('arcane-auth-token');
+    if (token) {
+      void clearServerSession(token);
+    }
+    emitCollabActivity('cleared studio session');
+    showToast('Studio session cleared.', 'success');
+  };
+
   const studioActions = useMemo(() => (
     <div className="flex flex-wrap items-center gap-3">
+      <button onClick={() => navigate('/collaboration')} className="arcane-btn arcane-btn-ghost">Collaborate</button>
       <button onClick={() => navigate('/technology')} className="arcane-btn arcane-btn-ghost">Architecture</button>
       <button onClick={openLiveMode} disabled={!apiKey} className="arcane-btn arcane-btn-primary disabled:opacity-45 disabled:cursor-not-allowed">Enter Live</button>
     </div>
   ), [navigate, apiKey]);
+
+  const CollaborationHubPage: React.FC = () => (
+    <SiteChrome theme={theme} onToggleTheme={onToggleTheme} authProfile={authProfile}>
+      <motion.section className="min-h-[70vh] p-6 sm:p-8" initial={{ opacity: 0 }} animate={{ opacity: 1 }}>
+        <div className="max-w-3xl mx-auto glass-panel rounded-3xl p-6 sm:p-8 space-y-5">
+          <p className="text-xs uppercase tracking-[0.22em] text-cyan-300/75">Collaboration Hub</p>
+          <h1 className="brand-title text-3xl sm:text-4xl">Live Studio Collaboration</h1>
+          <p className="text-slate-300">Create or join a room, then both collaborators can see studio activities live.</p>
+          <div className="grid grid-cols-1 sm:grid-cols-[1fr_auto_auto] gap-2">
+            <input
+              type="text"
+              value={shareInput}
+              onChange={(e) => setShareInput(e.target.value)}
+              placeholder="Paste collaboration link or code"
+              className="w-full rounded-xl bg-slate-950/60 border border-white/15 px-3 py-2 text-sm text-slate-100 outline-none focus:border-cyan-300/60"
+            />
+            <button className="arcane-btn arcane-btn-ghost" type="button" onClick={createCollaborationLink} disabled={isCreatingShare}>
+              {isCreatingShare ? 'Creating...' : 'Create Link'}
+            </button>
+            <button className="arcane-btn arcane-btn-primary" type="button" onClick={() => void importCollaborationCode(shareInput)} disabled={!shareInput.trim() || isImportingShare}>
+              {isImportingShare ? 'Joining...' : 'Join'}
+            </button>
+          </div>
+          {shareLink && <p className="text-xs text-cyan-200/85 break-all">Active link: {shareLink}</p>}
+          {activeCollabCode && (
+            <div className="flex flex-wrap gap-3 items-center">
+              <p className="text-sm text-slate-200">Room: <span className="text-cyan-200">{activeCollabCode}</span></p>
+              <button className="arcane-btn arcane-btn-primary" type="button" onClick={() => navigate(`/studio?collab=${activeCollabCode}`)}>Open Collaborative Studio</button>
+            </div>
+          )}
+        </div>
+      </motion.section>
+    </SiteChrome>
+  );
+
+  const CollaborationLinkPage: React.FC = () => {
+    const { code } = useParams();
+    const [loading, setLoading] = useState(true);
+    const [errorMessage, setErrorMessage] = useState('');
+    const [linkData, setLinkData] = useState<CollaborationLoadResponse | null>(null);
+
+    useEffect(() => {
+      let cancelled = false;
+      const load = async () => {
+        if (!code) {
+          setErrorMessage('Missing collaboration code.');
+          setLoading(false);
+          return;
+        }
+        try {
+          setLoading(true);
+          const response = await fetch(`/api/collab/${code}`);
+          if (!response.ok) {
+            throw new Error(response.status === 404 ? 'This collaboration link does not exist.' : 'Could not load this collaboration link.');
+          }
+          const data = (await response.json()) as CollaborationLoadResponse;
+          if (!cancelled) {
+            setLinkData(data);
+            setErrorMessage('');
+          }
+        } catch (err) {
+          if (!cancelled) {
+            setErrorMessage(err instanceof Error ? err.message : 'Could not load this collaboration link.');
+            setLinkData(null);
+          }
+        } finally {
+          if (!cancelled) setLoading(false);
+        }
+      };
+
+      void load();
+      return () => {
+        cancelled = true;
+      };
+    }, [code]);
+
+    return (
+      <SiteChrome theme={theme} onToggleTheme={onToggleTheme} authProfile={authProfile}>
+        <motion.section className="min-h-[70vh] p-6 sm:p-8" initial={{ opacity: 0 }} animate={{ opacity: 1 }}>
+          <div className="max-w-3xl mx-auto glass-panel rounded-3xl p-6 sm:p-8">
+            <p className="text-xs uppercase tracking-[0.22em] text-cyan-300/75 mb-2">Collaboration Link</p>
+            <h1 className="brand-title text-3xl sm:text-4xl mb-3">Shared ARcane Session</h1>
+
+            {loading ? (
+              <p className="text-slate-300">Loading collaboration session...</p>
+            ) : errorMessage ? (
+              <p className="text-rose-300">{errorMessage}</p>
+            ) : linkData ? (
+              <div className="space-y-4">
+                <p className="text-slate-200">Code: <span className="text-cyan-200">{linkData.code}</span></p>
+                <p className="text-slate-300 text-sm">
+                  {linkData.expiresAt ? `Expires ${new Date(linkData.expiresAt).toLocaleString()}` : 'No expiration date available.'}
+                </p>
+                <div className="flex flex-wrap gap-3">
+                  <button
+                    className="arcane-btn arcane-btn-primary"
+                    type="button"
+                    onClick={() => {
+                      if (!linkData.session) return;
+                      applyIncomingSession(linkData.session);
+                      setActiveCollabCode(linkData.code.toUpperCase());
+                      setShareLink(`${window.location.origin}/collab/${linkData.code.toUpperCase()}`);
+                      navigate(`/studio?collab=${linkData.code.toUpperCase()}`);
+                      showToast('Collaboration session imported.', 'success');
+                    }}
+                  >
+                    Open In Studio
+                  </button>
+                  <button className="arcane-btn arcane-btn-ghost" type="button" onClick={() => navigate('/studio')}>
+                    Go To Studio
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <p className="text-slate-300">No collaboration data found.</p>
+            )}
+          </div>
+        </motion.section>
+      </SiteChrome>
+    );
+  };
 
   return (
     <>
@@ -683,8 +1333,10 @@ const AppRoutes: React.FC<{ theme: ThemeMode; onToggleTheme: () => void }> = ({ 
           <Route path="/usecases" element={<SiteChrome theme={theme} onToggleTheme={onToggleTheme} authProfile={authProfile}><UseCasesPage /></SiteChrome>} />
           <Route path="/use-cases" element={<Navigate to="/usecases" replace />} />
           <Route path="/about" element={<SiteChrome theme={theme} onToggleTheme={onToggleTheme} authProfile={authProfile}><AboutPage /></SiteChrome>} />
+          <Route path="/collaboration" element={<CollaborationHubPage />} />
           <Route path="/signup" element={<SiteChrome theme={theme} onToggleTheme={onToggleTheme} authProfile={authProfile}><AuthPage initialMode="signup" /></SiteChrome>} />
           <Route path="/login" element={<SiteChrome theme={theme} onToggleTheme={onToggleTheme} authProfile={authProfile}><AuthPage initialMode="login" /></SiteChrome>} />
+          <Route path="/collab/:code" element={<CollaborationLinkPage />} />
           <Route
             path="/profile"
             element={
@@ -731,7 +1383,101 @@ const AppRoutes: React.FC<{ theme: ThemeMode; onToggleTheme: () => void }> = ({ 
                           </div>
                         </div>
                       </div>
-                      <div>
+                      <div className="space-y-6">
+                        <div className="glass-panel rounded-2xl p-6">
+                          <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+                            <h3 className="text-lg font-semibold">Session History</h3>
+                            <button className="arcane-btn arcane-btn-ghost" type="button" onClick={clearStudioSession}>Clear Session</button>
+                          </div>
+                          {activeCollabCode && (
+                            <p className="text-xs mb-4 text-slate-300">
+                              Live room: <span className="text-cyan-200">{activeCollabCode}</span> ·
+                              {' '}
+                              <span className={collabStatus === 'live' ? 'text-emerald-300' : collabStatus === 'connecting' ? 'text-amber-300' : 'text-slate-400'}>
+                                {collabStatus === 'live' ? 'Connected' : collabStatus === 'connecting' ? 'Connecting...' : 'Idle'}
+                              </span>
+                            </p>
+                          )}
+
+                          {!visibleHistory.length ? (
+                            <p className="text-slate-300 text-sm">No history yet. Generate an image to start autosave and version tracking.</p>
+                          ) : (
+                            <div className="space-y-3 max-h-[340px] overflow-auto pr-1">
+                              {visibleHistory.map((item) => (
+                                <div key={item.id} className="flex items-center gap-3 border border-white/10 rounded-xl p-2">
+                                  {item.base64 ? (
+                                    <img
+                                      src={`data:image/png;base64,${item.base64}`}
+                                      alt="History thumbnail"
+                                      className="w-16 h-16 rounded-lg object-cover border border-white/10"
+                                    />
+                                  ) : (
+                                    <div className="w-16 h-16 rounded-lg border border-white/10 bg-slate-900/60 grid place-items-center text-[10px] text-slate-400 text-center px-1">
+                                      DB Entry
+                                    </div>
+                                  )}
+                                  <div className="flex-1 min-w-0">
+                                    <p className="text-sm text-slate-100 truncate">{item.prompt}</p>
+                                    <p className="text-xs text-slate-400">{item.timestamp.toLocaleString()}</p>
+                                  </div>
+                                  <div className="flex items-center gap-2">
+                                    <button className="arcane-btn arcane-btn-ghost" type="button" onClick={() => { setCurrentImage(item); emitCollabActivity('opened a history item'); }} disabled={!item.base64}>Open</button>
+                                    <button className="arcane-btn arcane-btn-ghost" type="button" onClick={() => { setCompareSelection((prev) => ({ ...prev, left: item.id })); emitCollabActivity('set compare A'); }}>A</button>
+                                    <button className="arcane-btn arcane-btn-ghost" type="button" onClick={() => { setCompareSelection((prev) => ({ ...prev, right: item.id })); emitCollabActivity('set compare B'); }}>B</button>
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+
+                        {activeCollabCode && (
+                          <div className="glass-panel rounded-2xl p-6">
+                            <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+                              <h3 className="text-lg font-semibold">Live Activity</h3>
+                              <p className="text-xs text-slate-400">Realtime peer actions</p>
+                            </div>
+                            {!collabActivities.length ? (
+                              <p className="text-sm text-slate-300">No activity yet in this room.</p>
+                            ) : (
+                              <div className="space-y-2 max-h-52 overflow-auto pr-1">
+                                {collabActivities.map((activity) => (
+                                  <div key={activity.id} className="border border-white/10 rounded-xl p-2 bg-black/20">
+                                    <p className="text-sm text-slate-100">{activity.actor ? `${activity.actor} ${activity.text}` : activity.text}</p>
+                                    <p className="text-xs text-slate-400">{new Date(activity.timestamp).toLocaleTimeString()}</p>
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        )}
+
+                        <div className="glass-panel rounded-2xl p-6">
+                          <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+                            <h3 className="text-lg font-semibold">Compare</h3>
+                            <p className="text-xs text-slate-400">Select A and B from history</p>
+                          </div>
+                          {isCompareReady && compareLeft && compareRight ? (
+                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                              {[compareLeft, compareRight].map((image, idx) => (
+                                <div key={image.id} className="border border-white/10 rounded-xl p-3 bg-black/20">
+                                  <p className="text-xs uppercase tracking-[0.2em] text-cyan-300/80 mb-2">{idx === 0 ? 'Version A' : 'Version B'}</p>
+                                  {image.base64 ? (
+                                    <img src={`data:image/png;base64,${image.base64}`} alt={`Compare ${idx === 0 ? 'A' : 'B'}`} className="w-full h-auto rounded-lg border border-white/10" />
+                                  ) : (
+                                    <div className="w-full min-h-48 rounded-lg border border-white/10 bg-slate-900/60 grid place-items-center text-slate-400 text-sm">
+                                      Image data not available in DB entry
+                                    </div>
+                                  )}
+                                  <p className="text-xs text-slate-300 mt-2 line-clamp-2">{image.prompt}</p>
+                                </div>
+                              ))}
+                            </div>
+                          ) : (
+                            <p className="text-sm text-slate-300">Pick two different history entries using A and B to compare outputs.</p>
+                          )}
+                        </div>
+
                         <ImageCanvas image={currentImage} isLoading={isLoading} />
                       </div>
                     </div>

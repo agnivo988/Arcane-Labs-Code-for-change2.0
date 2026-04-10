@@ -10,9 +10,47 @@ const createToken = (user) => jwt.sign({ userId: user._id.toString(), email: use
 
 const safeUser = (user) => {
   const json = user.toJSON();
+  delete json.studioSessionState;
   return {
     ...json,
     id: json._id.toString()
+  };
+};
+
+const sanitizeImage = (image) => {
+  if (!image || typeof image !== 'object') return null;
+  const id = typeof image.id === 'string' ? image.id.slice(0, 120) : '';
+  const prompt = typeof image.prompt === 'string' ? image.prompt.slice(0, 1200) : '';
+  const timestamp = typeof image.timestamp === 'string' ? image.timestamp : new Date().toISOString();
+
+  if (!id || !prompt) return null;
+
+  return { id, prompt, timestamp };
+};
+
+const sanitizeSessionState = (payload) => {
+  if (!payload || typeof payload !== 'object') {
+    return {
+      currentImage: null,
+      imageHistory: [],
+      compareSelection: { left: null, right: null },
+      updatedAt: new Date().toISOString()
+    };
+  }
+
+  const currentImage = sanitizeImage(payload.currentImage);
+  const imageHistory = Array.isArray(payload.imageHistory)
+    ? payload.imageHistory.map(sanitizeImage).filter(Boolean).slice(0, 24)
+    : [];
+
+  const left = typeof payload?.compareSelection?.left === 'string' ? payload.compareSelection.left : null;
+  const right = typeof payload?.compareSelection?.right === 'string' ? payload.compareSelection.right : null;
+
+  return {
+    currentImage,
+    imageHistory,
+    compareSelection: { left, right },
+    updatedAt: new Date().toISOString()
   };
 };
 
@@ -81,6 +119,55 @@ router.get('/me', requireAuth, async (req, res) => {
     res.json({ user: safeUser(user) });
   } catch (error) {
     res.status(500).json({ message: error instanceof Error ? error.message : 'Failed to load profile' });
+  }
+});
+
+router.get('/me/session', requireAuth, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.userId).select('studioSessionState');
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+    res.json({ session: user.studioSessionState || null });
+  } catch (error) {
+    res.status(500).json({ message: error instanceof Error ? error.message : 'Failed to load session' });
+  }
+});
+
+router.put('/me/session', requireAuth, async (req, res) => {
+  try {
+    const sessionState = sanitizeSessionState(req.body?.session);
+    const user = await User.findByIdAndUpdate(
+      req.user.userId,
+      { $set: { studioSessionState: sessionState } },
+      { new: true }
+    ).select('studioSessionState');
+
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    res.json({ session: user.studioSessionState });
+  } catch (error) {
+    res.status(500).json({ message: error instanceof Error ? error.message : 'Failed to save session' });
+  }
+});
+
+router.delete('/me/session', requireAuth, async (req, res) => {
+  try {
+    const user = await User.findByIdAndUpdate(
+      req.user.userId,
+      { $set: { studioSessionState: null } },
+      { new: true }
+    ).select('_id');
+
+    if (!user) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(500).json({ message: error instanceof Error ? error.message : 'Failed to clear session' });
   }
 });
 
