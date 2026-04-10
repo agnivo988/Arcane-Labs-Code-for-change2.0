@@ -1,0 +1,246 @@
+import { useState, useCallback } from 'react';
+import { GoogleGenAI } from '@google/genai';
+
+interface QueueItem {
+  id: string;
+  execute: () => Promise<void>;
+}
+
+let requestQueue: QueueItem[] = [];
+let isProcessing = false;
+let lastRequestTime = 0;
+const modelCooldownUntil: Record<string, number> = {};
+
+const MIN_REQUEST_GAP_MS = Number(import.meta.env.VITE_GEMINI_MIN_REQUEST_GAP_MS || 550);
+const TRANSIENT_MODEL_COOLDOWN_MS = 60_000;
+const UNAVAILABLE_MODEL_COOLDOWN_MS = 10 * 60_000;
+
+const DEFAULT_IMAGE_MODELS = [
+  'gemini-2.5-flash-image',
+  'gemini-2.5-flash-image-preview',
+  'gemini-3.1-flash-image-preview'
+];
+
+const getCandidateModels = () => {
+  const overrideModel = (import.meta.env.VITE_GEMINI_IMAGE_MODEL || '').trim();
+  const candidates = overrideModel
+    ? [overrideModel, ...DEFAULT_IMAGE_MODELS.filter((model) => model !== overrideModel)]
+    : DEFAULT_IMAGE_MODELS;
+
+  const now = Date.now();
+  const readyModels = candidates.filter((model) => (modelCooldownUntil[model] || 0) <= now);
+  return readyModels.length ? readyModels : candidates;
+};
+
+const isModelAvailabilityError = (message: string) => {
+  const lower = message.toLowerCase();
+  return (
+    lower.includes('not found') ||
+    lower.includes('supported for generatecontent') ||
+    lower.includes('404')
+  );
+};
+
+const isTransientModelLoadError = (message: string) => {
+  const lower = message.toLowerCase();
+  return (
+    lower.includes('429') ||
+    lower.includes('resource_exhausted') ||
+    lower.includes('rate limit') ||
+    lower.includes('too many requests') ||
+    lower.includes('overloaded') ||
+    lower.includes('high traffic') ||
+    lower.includes('temporarily unavailable') ||
+    lower.includes('try again later')
+  );
+};
+
+const processQueue = async () => {
+  if (isProcessing || requestQueue.length === 0) return;
+  
+  isProcessing = true;
+  
+  while (requestQueue.length > 0) {
+    const now = Date.now();
+    const timeSinceLastRequest = now - lastRequestTime;
+    
+    if (timeSinceLastRequest < MIN_REQUEST_GAP_MS) {
+      await new Promise(resolve => setTimeout(resolve, MIN_REQUEST_GAP_MS - timeSinceLastRequest));
+    }
+    
+    const item = requestQueue.shift();
+    if (item) {
+      await item.execute();
+      lastRequestTime = Date.now();
+    }
+  }
+  
+  isProcessing = false;
+};
+
+export const useGeminiImage = (apiKey: string) => {
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const executeWithQueue = useCallback((operation: () => Promise<string>): Promise<string> => {
+    return new Promise((resolve, reject) => {
+      const id = Math.random().toString(36).substr(2, 9);
+      
+      requestQueue.push({
+        id,
+        execute: async () => {
+          try {
+            setIsLoading(true);
+            setError(null);
+            const result = await operation();
+            resolve(result);
+          } catch (err) {
+            const errorMessage = err instanceof Error ? err.message : 'Unknown error occurred';
+            setError(errorMessage);
+            reject(new Error(errorMessage));
+          } finally {
+            setIsLoading(false);
+          }
+        }
+      });
+      
+      processQueue();
+    });
+  }, []);
+
+  const callImageModelWithFallback = useCallback(async (
+    ai: GoogleGenAI,
+    contents: Array<string | { text: string } | { inlineData: { mimeType: string; data: string } }>
+  ) => {
+    const models = getCandidateModels();
+    let lastError: Error | null = null;
+
+    for (const model of models) {
+      try {
+        return await ai.models.generateContent({
+          model,
+          contents
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        const unavailable = isModelAvailabilityError(message);
+        const transient = isTransientModelLoadError(message);
+
+        if (!unavailable && !transient) {
+          throw err;
+        }
+
+        modelCooldownUntil[model] = Date.now() + (unavailable ? UNAVAILABLE_MODEL_COOLDOWN_MS : TRANSIENT_MODEL_COOLDOWN_MS);
+        lastError = err instanceof Error ? err : new Error(message);
+      }
+    }
+
+    throw new Error(
+      lastError?.message ||
+      'No compatible Gemini image model was found. Set VITE_GEMINI_IMAGE_MODEL to a model available in your account.'
+    );
+  }, []);
+
+  const generateImage = useCallback(async (prompt: string): Promise<string> => {
+    if (!apiKey) throw new Error('API key is required');
+    
+    return executeWithQueue(async () => {
+      const ai = new GoogleGenAI({ apiKey });
+      
+      const response = await callImageModelWithFallback(ai, [
+        `Generate an image based on this prompt: ${prompt}`
+      ]);
+      
+      if (!response.candidates?.[0]?.content?.parts) {
+        throw new Error('No response received from API');
+      }
+      
+      for (const part of response.candidates[0].content.parts) {
+        if (part.inlineData?.data) {
+          return part.inlineData.data;
+        }
+      }
+      
+      throw new Error('No image data received from API');
+    });
+  }, [apiKey, executeWithQueue, callImageModelWithFallback]);
+
+  const editImage = useCallback(async (base64Image: string, prompt: string): Promise<string> => {
+    if (!apiKey) throw new Error('API key is required');
+    
+    return executeWithQueue(async () => {
+      const ai = new GoogleGenAI({ apiKey });
+      
+      const contents = [
+        { text: `Edit this image based on the following instruction: ${prompt}` },
+        {
+          inlineData: {
+            mimeType: 'image/png',
+            data: base64Image,
+          },
+        },
+      ];
+      
+      const response = await callImageModelWithFallback(ai, contents);
+      
+      if (!response.candidates?.[0]?.content?.parts) {
+        throw new Error('No response received from API');
+      }
+      
+      for (const part of response.candidates[0].content.parts) {
+        if (part.inlineData?.data) {
+          return part.inlineData.data;
+        }
+      }
+      
+      throw new Error('No edited image data received from API');
+    });
+  }, [apiKey, executeWithQueue, callImageModelWithFallback]);
+
+  const fuseImages = useCallback(async (img1: string, img2: string, prompt: string): Promise<string> => {
+    if (!apiKey) throw new Error('API key is required');
+    
+    return executeWithQueue(async () => {
+      const ai = new GoogleGenAI({ apiKey });
+      
+      const contents = [
+        { text: `Fuse these two images together based on this instruction: ${prompt}` },
+        {
+          inlineData: {
+            mimeType: 'image/png',
+            data: img1,
+          },
+        },
+        {
+          inlineData: {
+            mimeType: 'image/png',
+            data: img2,
+          },
+        },
+      ];
+      
+      const response = await callImageModelWithFallback(ai, contents);
+      
+      if (!response.candidates?.[0]?.content?.parts) {
+        throw new Error('No response received from API');
+      }
+      
+      for (const part of response.candidates[0].content.parts) {
+        if (part.inlineData?.data) {
+          return part.inlineData.data;
+        }
+      }
+      
+      throw new Error('No fused image data received from API');
+    });
+  }, [apiKey, executeWithQueue, callImageModelWithFallback]);
+
+  return {
+    generateImage,
+    editImage,
+    fuseImages,
+    isLoading,
+    error,
+    clearError: () => setError(null)
+  };
+};
