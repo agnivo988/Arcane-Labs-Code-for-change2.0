@@ -1,7 +1,8 @@
-import React, { useState, useCallback, useEffect } from 'react';
+import React, { useState, useCallback, useEffect, useRef } from 'react';
 import { motion } from 'framer-motion';
 import { useGeminiImage } from '../hooks/useGeminiImage';
 import { useCameraStream } from '../hooks/useCameraStream';
+import { useWanAnimate } from '../hooks/useWanAnimate';
 
 interface ArcaneEngineLiveProps {
   apiKey: string;
@@ -9,20 +10,31 @@ interface ArcaneEngineLiveProps {
 }
 
 const ArcaneEngineLive: React.FC<ArcaneEngineLiveProps> = ({ apiKey, onBackToStudio }) => {
+  const [mode, setMode] = useState<'transform' | 'wan'>('transform');
   const [isProcessing, setIsProcessing] = useState(false);
   const [lastCommand, setLastCommand] = useState('');
   const [currentInput, setCurrentInput] = useState('');
   const [processedFrame, setProcessedFrame] = useState<string | null>(null);
+  const [wanPrompt, setWanPrompt] = useState('');
+  const [wanPreviewUrl, setWanPreviewUrl] = useState('');
+  const [wanDuration, setWanDuration] = useState(4);
+  const [wanFps, setWanFps] = useState(24);
+  const [wanLiveSync, setWanLiveSync] = useState(false);
+  const [wanStatus, setWanStatus] = useState('Idle');
   const [error, setError] = useState<string | null>(null);
+  const liveSyncInFlightRef = useRef(false);
+  const wanMediaRecorderRef = useRef<MediaRecorder | null>(null);
   
   const { editImage } = useGeminiImage(apiKey);
+  const { generateVideo, isGenerating: isWanGenerating, error: wanError, clearError: clearWanError } = useWanAnimate();
   const { 
     videoRef, 
     canvasRef, 
     isStreaming, 
     startCamera, 
     stopCamera, 
-    captureFrame
+    captureFrame,
+    getStream
   } = useCameraStream();
 
   const handleError = useCallback((errorMessage: string) => {
@@ -32,6 +44,130 @@ const ArcaneEngineLive: React.FC<ArcaneEngineLiveProps> = ({ apiKey, onBackToStu
   const clearError = useCallback(() => {
     setError(null);
   }, []);
+
+  useEffect(() => {
+    if (wanError) {
+      setError(wanError);
+    }
+  }, [wanError]);
+
+  const getWanFrame = useCallback(() => {
+    return captureFrame();
+  }, [captureFrame]);
+
+  const captureWanVideo = useCallback(async (durationMs: number): Promise<string> => {
+    const stream = getStream();
+    if (!stream) {
+      throw new Error('Camera stream is not available for Wan Animate');
+    }
+
+    if (wanMediaRecorderRef.current?.state === 'recording') {
+      wanMediaRecorderRef.current.stop();
+      wanMediaRecorderRef.current = null;
+    }
+
+    return await new Promise<string>((resolve, reject) => {
+      const chunks: BlobPart[] = [];
+      let recorder: MediaRecorder;
+
+      try {
+        recorder = new MediaRecorder(stream, { mimeType: 'video/webm;codecs=vp8' });
+      } catch {
+        try {
+          recorder = new MediaRecorder(stream, { mimeType: 'video/webm' });
+        } catch (error) {
+          reject(error instanceof Error ? error : new Error('Recording not supported in this browser'));
+          return;
+        }
+      }
+
+      wanMediaRecorderRef.current = recorder;
+
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) chunks.push(event.data);
+      };
+
+      recorder.onerror = () => {
+        reject(new Error('Failed to capture Wan video clip'));
+      };
+
+      recorder.onstop = async () => {
+        try {
+          const blob = new Blob(chunks, { type: recorder.mimeType || 'video/webm' });
+          const arrayBuffer = await blob.arrayBuffer();
+          const bytes = new Uint8Array(arrayBuffer);
+          let binary = '';
+          const chunkSize = 0x8000;
+          for (let i = 0; i < bytes.length; i += chunkSize) {
+            binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+          }
+          resolve(btoa(binary));
+        } catch (error) {
+          reject(error instanceof Error ? error : new Error('Failed to encode Wan video clip'));
+        }
+      };
+
+      recorder.start();
+      window.setTimeout(() => {
+        if (recorder.state === 'recording') {
+          recorder.stop();
+        }
+      }, durationMs);
+    });
+  }, [getStream]);
+
+  const renderWanClip = useCallback(async () => {
+    if (!isStreaming || !wanPrompt.trim() || liveSyncInFlightRef.current) return;
+
+    liveSyncInFlightRef.current = true;
+    setIsProcessing(true);
+    setLastCommand(`Wan 2.2 Animate: ${wanPrompt.trim()}`);
+    setWanStatus('Rendering clip...');
+
+    try {
+      const frameBase64 = getWanFrame();
+      const videoBase64 = await captureWanVideo(Math.max(2000, wanDuration * 1000));
+
+      if (!frameBase64 || !videoBase64) {
+        throw new Error('Could not capture camera media for Wan Animate');
+      }
+
+      const result = await generateVideo({
+        prompt: wanPrompt.trim(),
+        video: videoBase64,
+        videoBase64,
+        referenceVideo: videoBase64,
+        durationSeconds: wanDuration,
+        fps: wanFps,
+        liveSync: wanLiveSync
+      });
+
+      const videoUrl = result.videoUrl || (result.videoBase64 ? `data:${result.mimeType};base64,${result.videoBase64}` : '');
+      if (!videoUrl) {
+        throw new Error('Wan Animate did not return a playable video');
+      }
+
+      setWanPreviewUrl(videoUrl);
+      setWanStatus(wanLiveSync ? 'Live sync active' : 'Clip ready');
+    } catch (err) {
+      handleError(err instanceof Error ? err.message : 'Failed to generate Wan Animate clip');
+      setWanStatus('Idle');
+    } finally {
+      liveSyncInFlightRef.current = false;
+      setIsProcessing(false);
+    }
+  }, [generateVideo, getWanFrame, isStreaming, wanDuration, wanFps, wanLiveSync, wanPrompt, handleError]);
+
+  useEffect(() => {
+    if (!wanLiveSync || mode !== 'wan' || !isStreaming || !wanPrompt.trim()) return;
+
+    void renderWanClip();
+    const interval = window.setInterval(() => {
+      void renderWanClip();
+    }, 7000);
+
+    return () => window.clearInterval(interval);
+  }, [mode, isStreaming, renderWanClip, wanLiveSync, wanPrompt]);
 
   const processTextCommand = useCallback(async (command: string) => {
     if (!command.trim() || !isStreaming) return;
@@ -109,12 +245,27 @@ const ArcaneEngineLive: React.FC<ArcaneEngineLiveProps> = ({ apiKey, onBackToStu
           <canvas ref={canvasRef} className="hidden" width="512" height="288" />
           
           {/* AI Processed Frame Overlay */}
-          {processedFrame && (
+          {mode === 'transform' && processedFrame && (
             <div className="absolute inset-0 bg-black/90">
               <img
                 src={`data:image/jpeg;base64,${processedFrame}`}
                 alt="Arcane Engine transformed reality"
                 className="w-full h-full object-cover opacity-85"
+              />
+            </div>
+          )}
+
+          {mode === 'wan' && wanPreviewUrl && (
+            <div className="absolute inset-0 bg-black/90">
+              <video
+                key={wanPreviewUrl}
+                src={wanPreviewUrl}
+                autoPlay
+                muted
+                loop
+                playsInline
+                controls={false}
+                className="w-full h-full object-cover opacity-90"
               />
             </div>
           )}
@@ -136,6 +287,22 @@ const ArcaneEngineLive: React.FC<ArcaneEngineLiveProps> = ({ apiKey, onBackToStu
                 Arcane Engine Live
               </h1>
               <p className="text-slate-200 text-sm">Cinematic realtime scene transformations</p>
+              <div className="mt-3 flex justify-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setMode('transform')}
+                  className={`px-4 py-2 rounded-full border transition-colors ${mode === 'transform' ? 'bg-cyan-400 text-slate-950 border-cyan-300' : 'bg-slate-900/40 border-slate-200/20 text-slate-200'}`}
+                >
+                  Transform
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setMode('wan')}
+                  className={`px-4 py-2 rounded-full border transition-colors ${mode === 'wan' ? 'bg-emerald-400 text-slate-950 border-emerald-300' : 'bg-slate-900/40 border-slate-200/20 text-slate-200'}`}
+                >
+                  Wan 2.2 Animate
+                </button>
+              </div>
             </div>
           </div>
 
@@ -187,7 +354,7 @@ const ArcaneEngineLive: React.FC<ArcaneEngineLiveProps> = ({ apiKey, onBackToStu
           </div>
 
           {/* Transform Input - Only show when camera is streaming */}
-          {isStreaming && (
+          {mode === 'transform' && isStreaming && (
             <div className="mb-8">
               <h3 className="text-xl font-semibold mb-4 text-center">Scene Directive</h3>
               <form onSubmit={handleSubmitCommand} className="flex gap-3">
@@ -219,7 +386,7 @@ const ArcaneEngineLive: React.FC<ArcaneEngineLiveProps> = ({ apiKey, onBackToStu
           )}
 
           {/* Sample Prompts - Only show when camera is streaming */}
-          {isStreaming && (
+          {mode === 'transform' && isStreaming && (
             <div className="mb-8">
               <h3 className="text-lg font-semibold mb-4 text-center">Instant Looks</h3>
               <div className="grid grid-cols-2 gap-3">
@@ -250,7 +417,7 @@ const ArcaneEngineLive: React.FC<ArcaneEngineLiveProps> = ({ apiKey, onBackToStu
           )}
 
           {/* Status Display */}
-          {lastCommand && isStreaming && (
+          {mode === 'transform' && lastCommand && isStreaming && (
             <div className="text-center mb-8">
               <div className="bg-cyan-600/20 backdrop-blur-sm border border-cyan-400/30 rounded-lg p-4">
                 <p className="text-cyan-200 font-semibold">Active Directive:</p>
@@ -260,7 +427,7 @@ const ArcaneEngineLive: React.FC<ArcaneEngineLiveProps> = ({ apiKey, onBackToStu
           )}
 
           {/* Clear Effects Button */}
-          {processedFrame && isStreaming && (
+          {mode === 'transform' && processedFrame && isStreaming && (
             <div className="text-center mb-8">
               <motion.button
                 onClick={() => setProcessedFrame(null)}
@@ -278,6 +445,96 @@ const ArcaneEngineLive: React.FC<ArcaneEngineLiveProps> = ({ apiKey, onBackToStu
             <p className="mb-2">📱 <strong>Scroll up</strong> to view full camera</p>
             <p>🎬 <strong>Scroll down</strong> to access control deck</p>
           </div>
+
+          {mode === 'wan' && (
+            <div className="mt-12 bg-slate-900/60 rounded-3xl border border-emerald-300/20 p-6 max-w-4xl mx-auto">
+              <div className="text-center mb-8">
+                <h2 className="text-3xl font-bold mb-2">Wan 2.2 Animate</h2>
+                <p className="text-slate-300">Generate short animated clips from the live camera frame and keep syncing as the scene changes.</p>
+              </div>
+
+              <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 mb-6">
+                <div className="lg:col-span-2">
+                  <label className="block text-sm font-medium text-slate-200 mb-2">Animation Prompt</label>
+                  <textarea
+                    value={wanPrompt}
+                    onChange={(e) => setWanPrompt(e.target.value)}
+                    placeholder="Describe the motion, style, and environment changes for Wan 2.2 Animate..."
+                    className="w-full min-h-32 px-4 py-3 rounded-2xl bg-slate-900/70 border border-emerald-300/20 text-white placeholder-slate-400 focus:outline-none focus:border-emerald-300/60"
+                    disabled={isWanGenerating}
+                  />
+                </div>
+                <div className="space-y-4">
+                  <div>
+                    <label className="block text-sm font-medium text-slate-200 mb-2">Duration (sec)</label>
+                    <input
+                      type="number"
+                      min={2}
+                      max={12}
+                      value={wanDuration}
+                      onChange={(e) => setWanDuration(Number(e.target.value) || 4)}
+                      className="w-full px-4 py-3 rounded-2xl bg-slate-900/70 border border-emerald-300/20 text-white focus:outline-none focus:border-emerald-300/60"
+                      disabled={isWanGenerating}
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-slate-200 mb-2">FPS</label>
+                    <input
+                      type="number"
+                      min={12}
+                      max={60}
+                      value={wanFps}
+                      onChange={(e) => setWanFps(Number(e.target.value) || 24)}
+                      className="w-full px-4 py-3 rounded-2xl bg-slate-900/70 border border-emerald-300/20 text-white focus:outline-none focus:border-emerald-300/60"
+                      disabled={isWanGenerating}
+                    />
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-3 mb-6 justify-center">
+                <button
+                  type="button"
+                  onClick={() => void renderWanClip()}
+                  disabled={!isStreaming || isWanGenerating || !wanPrompt.trim()}
+                  className="bg-emerald-500 hover:bg-emerald-400 disabled:bg-slate-700 disabled:text-slate-400 text-slate-950 px-8 py-4 rounded-full font-semibold transition-colors"
+                >
+                  {isWanGenerating ? 'Generating...' : 'Generate Wan Clip'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setWanLiveSync((prev) => !prev)}
+                  disabled={!isStreaming || isWanGenerating}
+                  className={`px-8 py-4 rounded-full font-semibold transition-colors border ${wanLiveSync ? 'bg-cyan-400 text-slate-950 border-cyan-300' : 'bg-slate-900/60 text-white border-cyan-300/30'}`}
+                >
+                  {wanLiveSync ? 'Stop Live Sync' : 'Start Live Sync'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setWanPreviewUrl('');
+                    setWanStatus('Idle');
+                    clearWanError();
+                  }}
+                  className="px-8 py-4 rounded-full font-semibold transition-colors border border-white/15 bg-slate-900/50 text-white"
+                >
+                  Clear Clip
+                </button>
+              </div>
+
+              <div className="text-center text-slate-300 mb-4">
+                <p>{wanStatus}</p>
+              </div>
+
+              <div className="rounded-3xl overflow-hidden border border-emerald-300/20 bg-black/40 aspect-video flex items-center justify-center">
+                {wanPreviewUrl ? (
+                  <video src={wanPreviewUrl} autoPlay muted loop playsInline controls className="w-full h-full object-cover" />
+                ) : (
+                  <p className="text-slate-400 text-center px-6">Your Wan-generated clip will appear here after generation.</p>
+                )}
+              </div>
+            </div>
+          )}
 
         </div>
 
@@ -309,7 +566,7 @@ const ArcaneEngineLive: React.FC<ArcaneEngineLiveProps> = ({ apiKey, onBackToStu
       )}
 
       {/* API Key Required Modal */}
-      {!apiKey && (
+      {mode === 'transform' && !apiKey && (
         <div className="absolute inset-0 bg-black/80 flex items-center justify-center z-40 p-4">
           <div className="bg-slate-900/90 border border-cyan-200/20 backdrop-blur-sm rounded-lg p-6 max-w-sm w-full text-center">
             <h3 className="text-xl font-bold mb-4">API Key Required</h3>
