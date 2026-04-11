@@ -1,5 +1,6 @@
 import React, { useState, useCallback, useEffect, useRef } from 'react';
 import { motion } from 'framer-motion';
+import { useLocation } from 'react-router-dom';
 import { useGeminiImage } from '../hooks/useGeminiImage';
 import { useCameraStream } from '../hooks/useCameraStream';
 import { useWanAnimate } from '../hooks/useWanAnimate';
@@ -10,6 +11,8 @@ interface ArcaneEngineLiveProps {
 }
 
 const ArcaneEngineLive: React.FC<ArcaneEngineLiveProps> = ({ apiKey, onBackToStudio }) => {
+  const location = useLocation();
+  const sessionId = new URLSearchParams(location.search).get('sessionId') || '';
   const [mode, setMode] = useState<'transform' | 'wan'>('transform');
   const [isProcessing, setIsProcessing] = useState(false);
   const [lastCommand, setLastCommand] = useState('');
@@ -221,6 +224,11 @@ const ArcaneEngineLive: React.FC<ArcaneEngineLiveProps> = ({ apiKey, onBackToStu
 
   return (
     <div className="h-screen text-white relative overflow-y-auto overflow-x-hidden bg-slate-950">
+      {sessionId && (
+        <div className="fixed top-4 left-4 z-50 rounded-full border border-cyan-300/20 bg-slate-950/85 px-4 py-2 text-xs text-cyan-100 shadow-lg backdrop-blur">
+          RTC session: {sessionId}
+        </div>
+      )}
       {/* Scrollable Container */}
       <div className="min-h-[200vh]">
         

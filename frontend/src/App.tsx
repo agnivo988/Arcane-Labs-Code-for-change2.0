@@ -10,6 +10,7 @@ import ImageUpload from './components/ImageUpload';
 import Toast from './components/Toast';
 import ArcaneEngineLive from './components/ArcaneEngineLive';
 import AuthSection from './components/AuthSection';
+import SessionScheduler from './components/SessionScheduler';
 
 interface GeneratedImage {
   id: string;
@@ -1555,6 +1556,12 @@ const AppRoutes: React.FC<{ theme: ThemeMode; onToggleTheme: () => void }> = ({ 
                       {['Camera', 'Select', 'Mask', 'Generate', 'Blend'].map((item, idx) => <span key={item} className="flow-pill">{idx + 1}. {item}</span>)}
                     </div>
                     <ApiKeyInput apiKey={apiKey} onApiKeyChange={setApiKey} />
+                    <div className="mt-8">
+                      <SessionScheduler
+                        authToken={authToken}
+                        onOpenRtcRoom={(session) => navigate(`/live?sessionId=${encodeURIComponent(session.rtcSessionId)}`)}
+                      />
+                    </div>
                     <div className="grid grid-cols-1 xl:grid-cols-2 gap-8 mt-8">
                       <div className="space-y-6">
                         <PromptForm onGenerate={handleGenerate} onEdit={handleEdit} onFuse={handleFuse} isLoading={isLoading} hasImage={!!currentImage} hasUploadedImages={!!(uploadedImages.img1 && uploadedImages.img2)} />

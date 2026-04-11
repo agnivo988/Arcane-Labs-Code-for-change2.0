@@ -18,3 +18,14 @@ For Wan Animate, set:
 - `WAVESPEED_ENABLE_SYNC_MODE` if your model supports sync mode
 
 Legacy `WAN_ANIMATE_*` vars are still accepted for compatibility.
+
+For Google Meet scheduling, set:
+- `GOOGLE_CLIENT_ID`
+- `GOOGLE_CLIENT_SECRET`
+- `GOOGLE_REFRESH_TOKEN`
+- `GOOGLE_CALENDAR_ID` if you want to use a calendar other than `primary`
+- `GOOGLE_REDIRECT_URI` if your OAuth flow requires a custom redirect URI
+
+For the RTC handoff link, optionally set:
+- `RTC_PROVIDER_NAME`
+- `RTC_JOIN_URL_TEMPLATE` using `{sessionId}` as the placeholder

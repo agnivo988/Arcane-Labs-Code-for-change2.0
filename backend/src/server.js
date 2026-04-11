@@ -6,6 +6,7 @@ import { Server } from 'socket.io';
 import authRoutes from './routes/auth.js';
 import collaborationRoutes from './routes/collaboration.js';
 import wanRoutes from './routes/wan.js';
+import sessionRoutes from './routes/sessions.js';
 import billingRoutes, { handleStripeWebhook } from './routes/billing.js';
 import CollaborationLink from './models/CollaborationLink.js';
 import { connectDatabase } from './db.js';
@@ -128,6 +129,7 @@ app.get('/api/health', (_req, res) => {
 
 app.use('/api/auth', authRoutes);
 app.use('/api/collab', collaborationRoutes);
+app.use('/api/sessions', sessionRoutes);
 app.use('/api/wan', wanRoutes);
 app.use('/api/billing', billingRoutes);
 
