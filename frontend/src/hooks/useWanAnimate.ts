@@ -31,7 +31,7 @@ const normalizeResult = (data: any): WanAnimateResult => {
   };
 };
 
-const BACKEND_ORIGIN = import.meta.env.VITE_BACKEND_ORIGIN || 'http://localhost:4000';
+const BACKEND_ORIGIN = import.meta.env.VITE_BACKEND_ORIGIN || 'https://arcane-labs-code-for-change2-0.onrender.com';
 
 export const useWanAnimate = () => {
   const [isGenerating, setIsGenerating] = useState(false);

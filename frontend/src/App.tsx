@@ -72,7 +72,7 @@ interface CollaborationActivity {
 }
 
 const STUDIO_SESSION_STORAGE_KEY = 'arcane-studio-session-v1';
-const COLLAB_WS_ORIGIN = import.meta.env.VITE_BACKEND_ORIGIN || 'http://localhost:4000';
+const COLLAB_WS_ORIGIN = import.meta.env.VITE_BACKEND_ORIGIN || 'https://arcane-labs-code-for-change2-0.onrender.com';
 const FREE_IMAGE_LIMIT = 10;
 
 const normalizeImagePayload = (value?: string | null) => {
