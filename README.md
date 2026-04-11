@@ -87,4 +87,6 @@ npm run lint
 - Model compatibility error:
   - set `VITE_GEMINI_IMAGE_MODEL` in `.env` and restart the dev server.
 
-
+## Contributors
+-> Agniva Mukherjee
+-> Priyangshu Roy
