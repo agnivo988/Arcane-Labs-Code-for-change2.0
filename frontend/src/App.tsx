@@ -75,13 +75,39 @@ const STUDIO_SESSION_STORAGE_KEY = 'arcane-studio-session-v1';
 const COLLAB_WS_ORIGIN = import.meta.env.VITE_BACKEND_ORIGIN || 'http://localhost:4000';
 const FREE_IMAGE_LIMIT = 10;
 
+const normalizeImagePayload = (value?: string | null) => {
+  if (typeof value !== 'string') return '';
+  const trimmed = value.trim();
+  if (!trimmed) return '';
+  if (trimmed.startsWith('data:image/')) {
+    const split = trimmed.split(',');
+    return split.length > 1 ? split[1].trim() : '';
+  }
+  return trimmed;
+};
+
+const hasRenderableImageData = (value?: string | null) => normalizeImagePayload(value).length > 24;
+
+const toRenderableImageSrc = (value?: string | null) => {
+  if (typeof value !== 'string') return '';
+  const trimmed = value.trim();
+  if (!trimmed) return '';
+  if (trimmed.startsWith('data:image/')) return trimmed;
+  const normalized = normalizeImagePayload(trimmed);
+  if (!normalized) return '';
+  const mime = normalized.startsWith('/9j/') ? 'image/jpeg' : 'image/png';
+  return `data:${mime};base64,${normalized}`;
+};
+
 const toStoredImage = (image: GeneratedImage): StoredGeneratedImage => ({
   ...image,
+  base64: normalizeImagePayload(image.base64),
   timestamp: image.timestamp.toISOString()
 });
 
 const fromStoredImage = (image: StoredGeneratedImage): GeneratedImage => ({
   ...image,
+  base64: normalizeImagePayload(image.base64),
   timestamp: new Date(image.timestamp)
 });
 
@@ -604,7 +630,13 @@ const AppRoutes: React.FC<{ theme: ThemeMode; onToggleTheme: () => void }> = ({ 
   const historyLookup = useMemo(() => new Map(imageHistory.map((image) => [image.id, image])), [imageHistory]);
   const compareLeft = compareSelection.left ? historyLookup.get(compareSelection.left) || null : null;
   const compareRight = compareSelection.right ? historyLookup.get(compareSelection.right) || null : null;
-  const isCompareReady = !!(compareLeft && compareRight && compareLeft.id !== compareRight.id);
+  const isCompareReady = !!(
+    compareLeft &&
+    compareRight &&
+    compareLeft.id !== compareRight.id &&
+    hasRenderableImageData(compareLeft.base64) &&
+    hasRenderableImageData(compareRight.base64)
+  );
   const visibleHistory = imageHistory.length ? imageHistory : currentImage ? [currentImage] : [];
   const imagesGeneratedCount = authProfile?.imagesGenerated || 0;
   const isProPlan = authProfile?.plan === 'pro';
@@ -614,7 +646,7 @@ const AppRoutes: React.FC<{ theme: ThemeMode; onToggleTheme: () => void }> = ({ 
   const toGeneratedImage = (item: { id: string; prompt: string; timestamp: string; base64?: string }) => ({
     id: item.id,
     prompt: item.prompt,
-    base64: typeof item.base64 === 'string' ? item.base64 : '',
+    base64: normalizeImagePayload(typeof item.base64 === 'string' ? item.base64 : ''),
     timestamp: new Date(item.timestamp)
   });
 
@@ -647,14 +679,29 @@ const AppRoutes: React.FC<{ theme: ThemeMode; onToggleTheme: () => void }> = ({ 
       .filter((item) => item && item.id && item.prompt)
       .map(toGeneratedImage);
 
-    if (session.currentImage) {
-      setCurrentImage(toGeneratedImage(session.currentImage));
-    }
+    const incomingCurrent = session.currentImage ? toGeneratedImage(session.currentImage) : null;
+    const bestIncomingRenderable = incomingHistory.find((item) => hasRenderableImageData(item.base64)) || null;
+
+    setCurrentImage((prev) => {
+      if (incomingCurrent && hasRenderableImageData(incomingCurrent.base64)) return incomingCurrent;
+      if (prev && hasRenderableImageData(prev.base64)) return prev;
+      if (bestIncomingRenderable) return bestIncomingRenderable;
+      return prev;
+    });
 
     setImageHistory((prev) => {
-      const incomingById = new Map(incomingHistory.map((item) => [item.id, item]));
+      const localById = new Map(prev.map((item) => [item.id, item]));
+      const patchedIncoming = incomingHistory.map((item) => {
+        const local = localById.get(item.id);
+        if (local && hasRenderableImageData(local.base64) && !hasRenderableImageData(item.base64)) {
+          return local;
+        }
+        return item;
+      });
+
+      const incomingById = new Map(patchedIncoming.map((item) => [item.id, item]));
       const merged = [
-        ...incomingHistory,
+        ...patchedIncoming,
         ...prev.filter((item) => !incomingById.has(item.id))
       ].slice(0, 24);
       return merged;
@@ -863,6 +910,24 @@ const AppRoutes: React.FC<{ theme: ThemeMode; onToggleTheme: () => void }> = ({ 
     setTimeout(() => setToast(null), 5000);
   };
 
+  useEffect(() => {
+    setCompareSelection((prev) => {
+      const leftValid = prev.left ? !!historyLookup.get(prev.left)?.base64 : false;
+      const rightValid = prev.right ? !!historyLookup.get(prev.right)?.base64 : false;
+
+      const next = {
+        left: leftValid ? prev.left : null,
+        right: rightValid ? prev.right : null
+      };
+
+      if (next.left === prev.left && next.right === prev.right) {
+        return prev;
+      }
+
+      return next;
+    });
+  }, [historyLookup]);
+
   const startProCheckout = async () => {
     if (!authToken) {
       showToast('Please sign in to upgrade to Pro.', 'error');
@@ -922,6 +987,32 @@ const AppRoutes: React.FC<{ theme: ThemeMode; onToggleTheme: () => void }> = ({ 
       }
     } catch {
       // Ignore profile sync failures so the creative flow stays responsive.
+    }
+  };
+
+  const generatePreviewForHistoryEntry = async (entry: GeneratedImage) => {
+    if (!assertWithinGenerationLimit()) return;
+
+    try {
+      const base64 = normalizeImagePayload(await generateImage(entry.prompt));
+      if (!hasRenderableImageData(base64)) {
+        throw new Error('Preview generation returned invalid image data.');
+      }
+
+      const next = {
+        ...entry,
+        base64,
+        timestamp: new Date()
+      };
+
+      setImageHistory((prev) => [next, ...prev.filter((item) => item.id !== entry.id)].slice(0, 24));
+      setCurrentImage(next);
+
+      void trackStudioSubmit('generate');
+      emitCollabActivity('generated preview for a history entry');
+      showToast('Preview generated successfully.', 'success');
+    } catch (err) {
+      showToast(err instanceof Error ? err.message : 'Failed to generate preview.', 'error');
     }
   };
 
@@ -1006,11 +1097,13 @@ const AppRoutes: React.FC<{ theme: ThemeMode; onToggleTheme: () => void }> = ({ 
           const serverCurrent = serverSession.currentImage;
           setCurrentImage((prev) => {
             if (prev?.id === serverCurrent.id) return prev;
-            if (prev && prev.base64 && prev.id !== serverCurrent.id) return prev;
+            if (prev && hasRenderableImageData(prev.base64) && prev.id !== serverCurrent.id) return prev;
+            const normalizedBase64 = normalizeImagePayload(typeof serverCurrent.base64 === 'string' ? serverCurrent.base64 : '');
+            if (!hasRenderableImageData(normalizedBase64)) return prev;
             return {
               id: serverCurrent.id,
               prompt: serverCurrent.prompt,
-              base64: typeof serverCurrent.base64 === 'string' ? serverCurrent.base64 : '',
+              base64: normalizedBase64,
               timestamp: new Date(serverCurrent.timestamp)
             };
           });
@@ -1229,7 +1322,7 @@ const AppRoutes: React.FC<{ theme: ThemeMode; onToggleTheme: () => void }> = ({ 
     if (!assertWithinGenerationLimit()) return;
     try {
       const base64 = await generateImage(prompt);
-      const nextImage = { id: Date.now().toString(), base64, prompt, timestamp: new Date() };
+      const nextImage = { id: Date.now().toString(), base64: normalizeImagePayload(base64), prompt, timestamp: new Date() };
       setCurrentImage(nextImage);
       setImageHistory((prev) => [nextImage, ...prev.filter((item) => item.id !== nextImage.id)].slice(0, 24));
       void trackStudioSubmit('generate');
@@ -1244,7 +1337,7 @@ const AppRoutes: React.FC<{ theme: ThemeMode; onToggleTheme: () => void }> = ({ 
     if (!currentImage) return showToast('No image to edit. Generate an image first.', 'error');
     try {
       const base64 = await editImage(currentImage.base64, prompt);
-      const nextImage = { id: Date.now().toString(), base64, prompt: `${currentImage.prompt} → ${prompt}`, timestamp: new Date() };
+      const nextImage = { id: Date.now().toString(), base64: normalizeImagePayload(base64), prompt: `${currentImage.prompt} → ${prompt}`, timestamp: new Date() };
       setCurrentImage(nextImage);
       setImageHistory((prev) => [nextImage, ...prev.filter((item) => item.id !== nextImage.id)].slice(0, 24));
       void trackStudioSubmit('edit');
@@ -1259,7 +1352,7 @@ const AppRoutes: React.FC<{ theme: ThemeMode; onToggleTheme: () => void }> = ({ 
     if (!uploadedImages.img1 || !uploadedImages.img2) return showToast('Please upload two images to fuse.', 'error');
     try {
       const base64 = await fuseImages(uploadedImages.img1, uploadedImages.img2, prompt);
-      const nextImage = { id: Date.now().toString(), base64, prompt: `Fused: ${prompt}`, timestamp: new Date() };
+      const nextImage = { id: Date.now().toString(), base64: normalizeImagePayload(base64), prompt: `Fused: ${prompt}`, timestamp: new Date() };
       setCurrentImage(nextImage);
       setImageHistory((prev) => [nextImage, ...prev.filter((item) => item.id !== nextImage.id)].slice(0, 24));
       void trackStudioSubmit('fuse');
@@ -1495,9 +1588,9 @@ const AppRoutes: React.FC<{ theme: ThemeMode; onToggleTheme: () => void }> = ({ 
                             <div className="space-y-3 max-h-[340px] overflow-auto pr-1">
                               {visibleHistory.map((item) => (
                                 <div key={item.id} className="flex items-center gap-3 border border-white/10 rounded-xl p-2">
-                                  {item.base64 ? (
+                                  {hasRenderableImageData(item.base64) ? (
                                     <img
-                                      src={`data:image/png;base64,${item.base64}`}
+                                      src={toRenderableImageSrc(item.base64)}
                                       alt="History thumbnail"
                                       className="w-16 h-16 rounded-lg object-cover border border-white/10"
                                     />
@@ -1511,9 +1604,34 @@ const AppRoutes: React.FC<{ theme: ThemeMode; onToggleTheme: () => void }> = ({ 
                                     <p className="text-xs text-slate-400">{item.timestamp.toLocaleString()}</p>
                                   </div>
                                   <div className="flex items-center gap-2">
-                                    <button className="arcane-btn arcane-btn-ghost" type="button" onClick={() => { setCurrentImage(item); emitCollabActivity('opened a history item'); }} disabled={!item.base64}>Open</button>
-                                    <button className="arcane-btn arcane-btn-ghost" type="button" onClick={() => { setCompareSelection((prev) => ({ ...prev, left: item.id })); emitCollabActivity('set compare A'); }}>A</button>
-                                    <button className="arcane-btn arcane-btn-ghost" type="button" onClick={() => { setCompareSelection((prev) => ({ ...prev, right: item.id })); emitCollabActivity('set compare B'); }}>B</button>
+                                    <button className="arcane-btn arcane-btn-ghost" type="button" onClick={() => { setCurrentImage(item); emitCollabActivity('opened a history item'); }} disabled={!hasRenderableImageData(item.base64)}>Open</button>
+                                    <button
+                                      className="arcane-btn arcane-btn-ghost"
+                                      type="button"
+                                      onClick={() => { setCompareSelection((prev) => ({ ...prev, left: item.id })); emitCollabActivity('set compare A'); }}
+                                      disabled={!hasRenderableImageData(item.base64)}
+                                      title={!hasRenderableImageData(item.base64) ? 'This entry has metadata only and cannot be compared.' : 'Set as version A'}
+                                    >
+                                      A
+                                    </button>
+                                    <button
+                                      className="arcane-btn arcane-btn-ghost"
+                                      type="button"
+                                      onClick={() => { setCompareSelection((prev) => ({ ...prev, right: item.id })); emitCollabActivity('set compare B'); }}
+                                      disabled={!hasRenderableImageData(item.base64)}
+                                      title={!hasRenderableImageData(item.base64) ? 'This entry has metadata only and cannot be compared.' : 'Set as version B'}
+                                    >
+                                      B
+                                    </button>
+                                    {!hasRenderableImageData(item.base64) && (
+                                      <button
+                                        className="arcane-btn arcane-btn-ghost"
+                                        type="button"
+                                        onClick={() => void generatePreviewForHistoryEntry(item)}
+                                      >
+                                        Generate Preview
+                                      </button>
+                                    )}
                                   </div>
                                 </div>
                               ))}
@@ -1552,11 +1670,11 @@ const AppRoutes: React.FC<{ theme: ThemeMode; onToggleTheme: () => void }> = ({ 
                               {[compareLeft, compareRight].map((image, idx) => (
                                 <div key={image.id} className="border border-white/10 rounded-xl p-3 bg-black/20">
                                   <p className="text-xs uppercase tracking-[0.2em] text-cyan-300/80 mb-2">{idx === 0 ? 'Version A' : 'Version B'}</p>
-                                  {image.base64 ? (
-                                    <img src={`data:image/png;base64,${image.base64}`} alt={`Compare ${idx === 0 ? 'A' : 'B'}`} className="w-full h-auto rounded-lg border border-white/10" />
+                                  {hasRenderableImageData(image.base64) ? (
+                                    <img src={toRenderableImageSrc(image.base64)} alt={`Compare ${idx === 0 ? 'A' : 'B'}`} className="w-full h-auto rounded-lg border border-white/10" />
                                   ) : (
                                     <div className="w-full min-h-48 rounded-lg border border-white/10 bg-slate-900/60 grid place-items-center text-slate-400 text-sm">
-                                      Image data not available in DB entry
+                                      This entry has metadata only.
                                     </div>
                                   )}
                                   <p className="text-xs text-slate-300 mt-2 line-clamp-2">{image.prompt}</p>
@@ -1564,7 +1682,7 @@ const AppRoutes: React.FC<{ theme: ThemeMode; onToggleTheme: () => void }> = ({ 
                               ))}
                             </div>
                           ) : (
-                            <p className="text-sm text-slate-300">Pick two different history entries using A and B to compare outputs.</p>
+                            <p className="text-sm text-slate-300">Pick two different history entries with image data using A and B to compare outputs.</p>
                           )}
                         </div>
 

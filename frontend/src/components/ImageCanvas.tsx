@@ -14,11 +14,35 @@ interface ImageCanvasProps {
 }
 
 const ImageCanvas: React.FC<ImageCanvasProps> = ({ image, isLoading }) => {
+  const normalizeBase64 = (value?: string | null) => {
+    if (typeof value !== 'string') return '';
+    const trimmed = value.trim();
+    if (!trimmed) return '';
+    if (trimmed.startsWith('data:image/')) {
+      const split = trimmed.split(',');
+      return split.length > 1 ? split[1].trim() : '';
+    }
+    return trimmed;
+  };
+
+  const toImageSrc = (value?: string | null) => {
+    if (typeof value !== 'string') return '';
+    const trimmed = value.trim();
+    if (!trimmed) return '';
+    if (trimmed.startsWith('data:image/')) return trimmed;
+    const normalized = normalizeBase64(trimmed);
+    if (!normalized) return '';
+    const mime = normalized.startsWith('/9j/') ? 'image/jpeg' : 'image/png';
+    return `data:${mime};base64,${normalized}`;
+  };
+
+  const imageSrc = image ? toImageSrc(image.base64) : '';
+
   const downloadImage = () => {
     if (!image) return;
     
     const link = document.createElement('a');
-    link.href = `data:image/png;base64,${image.base64}`;
+    link.href = imageSrc;
     link.download = `arcane-engine-${image.id}.png`;
     document.body.appendChild(link);
     link.click();
@@ -53,6 +77,19 @@ const ImageCanvas: React.FC<ImageCanvasProps> = ({ image, isLoading }) => {
     );
   }
 
+  if (!imageSrc) {
+    return (
+      <div className="glass-panel rounded-2xl p-8">
+        <div className="canvas-empty flex flex-col items-center justify-center h-96 rounded-xl">
+          <h3 className="text-xl font-semibold text-slate-100 mb-2">Image Could Not Be Rendered</h3>
+          <p className="text-slate-300 text-center max-w-sm">
+            The generation returned an unsupported image payload. Try generating again.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <motion.div className="glass-panel rounded-2xl p-6" whileHover={{ y: -2 }}>
       <div className="flex justify-between items-center mb-4">
@@ -70,7 +107,7 @@ const ImageCanvas: React.FC<ImageCanvasProps> = ({ image, isLoading }) => {
       <div className="space-y-4">
         <motion.div className="relative group overflow-hidden rounded-xl" whileHover={{ scale: 1.01 }}>
           <img
-            src={`data:image/png;base64,${image.base64}`}
+            src={imageSrc}
             alt="Generated image"
             className="w-full h-auto rounded-xl border border-cyan-200/20"
           />

@@ -31,12 +31,14 @@ const normalizeResult = (data: any): WanAnimateResult => {
   };
 };
 
+const BACKEND_ORIGIN = import.meta.env.VITE_BACKEND_ORIGIN || 'http://localhost:4000';
+
 export const useWanAnimate = () => {
   const [isGenerating, setIsGenerating] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const generateVideo = useCallback(async (request: WanAnimateRequest): Promise<WanAnimateResult> => {
-    const response = await fetch('/api/wan/animate', {
+    const response = await fetch(`${BACKEND_ORIGIN}/api/wan/animate`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json'
