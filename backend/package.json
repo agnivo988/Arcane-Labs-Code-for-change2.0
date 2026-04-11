@@ -15,8 +15,9 @@
     "googleapis": "^171.4.0",
     "jsonwebtoken": "^9.0.2",
     "mongoose": "^8.18.0",
-    "wavespeed": "^0.2.3",
+    "nodemailer": "^8.0.5",
     "socket.io": "^4.8.3",
-    "stripe": "^22.0.1"
+    "stripe": "^22.0.1",
+    "wavespeed": "^0.2.3"
   }
 }

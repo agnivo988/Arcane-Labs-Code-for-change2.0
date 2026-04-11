@@ -29,3 +29,11 @@ For Google Meet scheduling, set:
 For the RTC handoff link, optionally set:
 - `RTC_PROVIDER_NAME`
 - `RTC_JOIN_URL_TEMPLATE` using `{sessionId}` as the placeholder
+
+For attendee email notifications, set:
+- `SMTP_HOST`
+- `SMTP_PORT`
+- `SMTP_SECURE` (`true` or `false`)
+- `SMTP_USER`
+- `SMTP_PASS`
+- `SMTP_FROM`

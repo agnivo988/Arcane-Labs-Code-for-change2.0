@@ -1,6 +1,7 @@
 import express from 'express';
 import crypto from 'crypto';
 import { google } from 'googleapis';
+import nodemailer from 'nodemailer';
 import ScheduledSession from '../models/ScheduledSession.js';
 import { requireAuth } from '../middleware/auth.js';
 
@@ -28,6 +29,24 @@ const buildRtcJoinUrl = (sessionId) => {
 };
 
 const createRtcSessionId = () => `rtc-${crypto.randomUUID()}`;
+
+const getMailerTransport = () => {
+  const host = process.env.SMTP_HOST;
+  const port = Number(process.env.SMTP_PORT || 587);
+  const user = process.env.SMTP_USER;
+  const pass = process.env.SMTP_PASS;
+
+  if (!host || !port || !user || !pass) {
+    return null;
+  }
+
+  return nodemailer.createTransport({
+    host,
+    port,
+    secure: String(process.env.SMTP_SECURE || '').toLowerCase() === 'true' || port === 465,
+    auth: { user, pass }
+  });
+};
 
 const getCalendarClient = () => {
   const clientId = process.env.GOOGLE_CLIENT_ID;
@@ -75,10 +94,81 @@ const toSessionResponse = (session) => ({
   googleMeetUrl: session.googleMeetUrl,
   calendarSyncStatus: session.calendarSyncStatus,
   calendarSyncError: session.calendarSyncError,
+  emailNotificationStatus: session.emailNotificationStatus,
+  emailNotificationError: session.emailNotificationError,
+  emailNotifiedAt: session.emailNotifiedAt,
   attendeeEmails: session.attendeeEmails,
   createdAt: session.createdAt,
   updatedAt: session.updatedAt
 });
+
+const notifyAttendeesByEmail = async ({ session, organizerEmail }) => {
+  if (!Array.isArray(session.attendeeEmails) || session.attendeeEmails.length === 0) {
+    return { status: 'skipped', error: null, sentAt: null };
+  }
+
+  const transporter = getMailerTransport();
+  if (!transporter) {
+    return {
+      status: 'not_configured',
+      error: 'SMTP is not configured. Set SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, and SMTP_FROM.',
+      sentAt: null
+    };
+  }
+
+  const startsAt = new Date(session.startsAt);
+  const endsAt = new Date(session.endsAt);
+  const fromAddress = process.env.SMTP_FROM || process.env.SMTP_USER;
+  const frontendOrigin = process.env.FRONTEND_ORIGIN || 'http://localhost:3000';
+  const sessionPageUrl = `${frontendOrigin}/studio`;
+
+  const lines = [
+    `You have been invited to: ${session.title}`,
+    '',
+    `Start: ${startsAt.toISOString()}`,
+    `End: ${endsAt.toISOString()}`,
+    `Duration: ${session.durationMinutes} minutes`,
+    '',
+    `Primary live room (RTC): ${session.rtcJoinUrl || sessionPageUrl}`,
+    `RTC Session ID: ${session.rtcSessionId}`,
+    `Google Meet fallback: ${session.googleMeetUrl || 'Not available yet'}`,
+    '',
+    session.notes ? `Notes: ${session.notes}` : '',
+    `Organizer: ${organizerEmail || 'Arcane Engine'}`
+  ].filter(Boolean);
+
+  const html = `
+    <div style="font-family: Arial, sans-serif; line-height: 1.6; color: #0f172a;">
+      <h2 style="margin-bottom: 8px;">${session.title}</h2>
+      <p style="margin: 4px 0;"><strong>Start:</strong> ${startsAt.toLocaleString()}</p>
+      <p style="margin: 4px 0;"><strong>End:</strong> ${endsAt.toLocaleString()}</p>
+      <p style="margin: 4px 0;"><strong>Duration:</strong> ${session.durationMinutes} minutes</p>
+      <p style="margin: 12px 0 4px;"><strong>Primary live room (RTC):</strong> <a href="${session.rtcJoinUrl || sessionPageUrl}">${session.rtcJoinUrl || sessionPageUrl}</a></p>
+      <p style="margin: 4px 0;"><strong>RTC Session ID:</strong> ${session.rtcSessionId}</p>
+      <p style="margin: 4px 0;"><strong>Google Meet fallback:</strong> ${session.googleMeetUrl ? `<a href="${session.googleMeetUrl}">${session.googleMeetUrl}</a>` : 'Not available yet'}</p>
+      ${session.notes ? `<p style="margin: 12px 0 4px;"><strong>Notes:</strong> ${session.notes}</p>` : ''}
+      <p style="margin: 12px 0 0; color: #475569;">Organizer: ${organizerEmail || 'Arcane Engine'}</p>
+    </div>
+  `;
+
+  try {
+    await transporter.sendMail({
+      from: fromAddress,
+      to: session.attendeeEmails.join(','),
+      subject: `[Arcane Session] ${session.title}`,
+      text: lines.join('\n'),
+      html
+    });
+
+    return { status: 'sent', error: null, sentAt: new Date() };
+  } catch (error) {
+    return {
+      status: 'failed',
+      error: error instanceof Error ? error.message : 'Failed to send attendee emails.',
+      sentAt: null
+    };
+  }
+};
 
 router.get('/', requireAuth, async (req, res) => {
   try {
@@ -132,6 +222,8 @@ router.post('/', requireAuth, async (req, res) => {
       attendeeEmails
     });
 
+    let persistedSession = session;
+
     const calendar = getCalendarClient();
     if (!calendar) {
       const updated = await ScheduledSession.findByIdAndUpdate(
@@ -144,76 +236,92 @@ router.post('/', requireAuth, async (req, res) => {
         },
         { new: true }
       );
+      persistedSession = updated || session;
+    } else {
+      try {
+        const calendarId = process.env.GOOGLE_CALENDAR_ID || 'primary';
+        const requestId = `arcane-${rtcSessionId}`;
+        const event = {
+          summary: title,
+          description: notes,
+          start: { dateTime: startsAt.toISOString(), timeZone },
+          end: { dateTime: endsAt.toISOString(), timeZone },
+          attendees: attendeeEmails.map((email) => ({ email })),
+          conferenceData: {
+            createRequest: {
+              requestId,
+              conferenceSolutionKey: { type: 'hangoutsMeet' }
+            }
+          }
+        };
 
-      return res.status(201).json({ session: toSessionResponse(updated || session) });
+        const response = await calendar.events.insert({
+          calendarId,
+          requestBody: event,
+          conferenceDataVersion: 1,
+          sendUpdates: attendeeEmails.length ? 'all' : 'none'
+        });
+
+        const googleMeetUrl = extractMeetUrl(response.data);
+        const updated = await ScheduledSession.findByIdAndUpdate(
+          session._id,
+          {
+            $set: {
+              googleCalendarId: calendarId,
+              googleCalendarEventId: response.data.id || null,
+              googleCalendarHtmlLink: response.data.htmlLink || null,
+              googleMeetUrl,
+              calendarSyncStatus: 'synced',
+              calendarSyncError: null
+            }
+          },
+          { new: true }
+        );
+
+        persistedSession = updated || session;
+      } catch (calendarError) {
+        const message = calendarError instanceof Error ? calendarError.message : 'Failed to create Google Meet link.';
+        const updated = await ScheduledSession.findByIdAndUpdate(
+          session._id,
+          {
+            $set: {
+              calendarSyncStatus: 'failed',
+              calendarSyncError: message
+            }
+          },
+          { new: true }
+        );
+
+        persistedSession = updated || session;
+      }
     }
 
-    try {
-      const calendarId = process.env.GOOGLE_CALENDAR_ID || 'primary';
-      const requestId = `arcane-${rtcSessionId}`;
-      const event = {
-        summary: title,
-        description: notes,
-        start: { dateTime: startsAt.toISOString(), timeZone },
-        end: { dateTime: endsAt.toISOString(), timeZone },
-        attendees: attendeeEmails.map((email) => ({ email })),
-        conferenceData: {
-          createRequest: {
-            requestId,
-            conferenceSolutionKey: { type: 'hangoutsMeet' }
-          }
+    const mailResult = await notifyAttendeesByEmail({
+      session: persistedSession,
+      organizerEmail: typeof req.user?.email === 'string' ? req.user.email : null
+    });
+
+    const updated = await ScheduledSession.findByIdAndUpdate(
+      persistedSession._id,
+      {
+        $set: {
+          emailNotificationStatus: mailResult.status,
+          emailNotificationError: mailResult.error,
+          emailNotifiedAt: mailResult.sentAt
         }
-      };
+      },
+      { new: true }
+    );
 
-      const response = await calendar.events.insert({
-        calendarId,
-        requestBody: event,
-        conferenceDataVersion: 1,
-        sendUpdates: attendeeEmails.length ? 'all' : 'none'
-      });
+    const responsePayload = {
+      session: toSessionResponse(updated || persistedSession)
+    };
 
-      const googleMeetUrl = extractMeetUrl(response.data);
-      const updated = await ScheduledSession.findByIdAndUpdate(
-        session._id,
-        {
-          $set: {
-            googleCalendarId: calendarId,
-            googleCalendarEventId: response.data.id || null,
-            googleCalendarHtmlLink: response.data.htmlLink || null,
-            googleMeetUrl,
-            calendarSyncStatus: 'synced',
-            calendarSyncError: null
-          }
-        },
-        { new: true }
-      );
-
-      return res.status(201).json({
-        session: toSessionResponse(updated || session),
-        googleEvent: {
-          id: response.data.id || null,
-          htmlLink: response.data.htmlLink || null,
-          meetUrl: googleMeetUrl
-        }
-      });
-    } catch (calendarError) {
-      const message = calendarError instanceof Error ? calendarError.message : 'Failed to create Google Meet link.';
-      const updated = await ScheduledSession.findByIdAndUpdate(
-        session._id,
-        {
-          $set: {
-            calendarSyncStatus: 'failed',
-            calendarSyncError: message
-          }
-        },
-        { new: true }
-      );
-
-      return res.status(201).json({
-        session: toSessionResponse(updated || session),
-        warning: message
-      });
+    if (mailResult.error) {
+      responsePayload.warning = mailResult.error;
     }
+
+    return res.status(201).json(responsePayload);
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Failed to schedule session.';
     return res.status(500).json({ message });

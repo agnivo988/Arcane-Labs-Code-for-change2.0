@@ -19,6 +19,9 @@ const scheduledSessionSchema = new mongoose.Schema(
     googleMeetUrl: { type: String, default: null },
     calendarSyncStatus: { type: String, enum: ['pending', 'synced', 'not_configured', 'failed'], default: 'pending' },
     calendarSyncError: { type: String, default: null },
+    emailNotificationStatus: { type: String, enum: ['pending', 'sent', 'not_configured', 'failed', 'skipped'], default: 'pending' },
+    emailNotificationError: { type: String, default: null },
+    emailNotifiedAt: { type: Date, default: null },
     attendeeEmails: { type: [String], default: [] }
   },
   { timestamps: true }
