@@ -10,7 +10,7 @@ export default defineConfig({
   server: {
     port: 3000,
     proxy: {
-      '/api': 'http://localhost:4000'  //change this during production to the actual backend url
+      '/api': 'https://arcane-labs-code-for-change2-0.onrender.com'  //change this during production to the actual backend url
     }
   },
 })
